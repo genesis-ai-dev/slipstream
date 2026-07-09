@@ -1,0 +1,937 @@
+# Constrained Few-Shot Translation Batch Loop — Implementation Plan
+
+**Branch:** `feat/constrained-translation-loop`  
+**Model target:** Qwen3.5-9B served locally via vLLM with XGrammar structured generation  
+**Status:** Plan only — no production code yet  
+**Date:** 2026-07-09
+
+---
+
+## Table of Contents
+
+1. [Objective & Scope](#1-objective--scope)
+2. [Technical Invariants](#2-technical-invariants)
+3. [Repository Context](#3-repository-context)
+4. [Package Layout](#4-package-layout)
+5. [Data Schemas](#5-data-schemas)
+6. [Evidence Tiers for Vocabulary Extraction](#6-evidence-tiers-for-vocabulary-extraction)
+7. [Component Specifications](#7-component-specifications)
+8. [Sequential Task Breakdown](#8-sequential-task-breakdown)
+9. [Pre-flight, Revision, and Abort Gates](#9-pre-flight-revision-and-abort-gates)
+10. [Acceptance Criteria](#10-acceptance-criteria)
+11. [Dependencies & Environment](#11-dependencies--environment)
+
+---
+
+## 1. Objective & Scope
+
+Build a new Python package `constrained_translation/` that:
+
+- Accepts a batch of source-language sentences.
+- For each sentence retrieves **~5 semantic** + **~5 coverage-targeted** aligned sentence pairs from an eBible corpus.
+- Derives an **only-attested target vocabulary** from those 10 examples (evidence tier explicitly documented).
+- Pre-detects uncovered source spans and emits `[UNK:source_span]` markers **deterministically before model generation**.
+- Builds a **per-request XGrammar grammar** allowing only attested surface tokens plus `[UNK:…]` markers.
+- Calls a local vLLM endpoint with that grammar; **no silent fallback to unconstrained generation**.
+- Performs a **post-decode token-ID audit** verifying every emitted token maps to an attested surface form.
+- Writes **JSONL logs** (coverage failures, retries, provenance of each example used).
+- Emits **batch rollup stats**: total units, tok/s, coverage-pass %, retry %, hard-failure %.
+
+Out of scope for this plan cycle: fine-tuning, RLHF, any changes to existing `query/`, `metrics/`, or `benchmarks/` packages.
+
+---
+
+## 2. Technical Invariants
+
+These must be preserved by every task and every code review.
+
+| # | Invariant |
+|---|-----------|
+| I1 | **Sentence-overlap ≠ word alignment.** Evidence tiers must be defined and documented. Sentence-overlap evidence is the default (Tier 1). No code may name or treat it as word alignment. |
+| I2 | **Grammar over surface tokens, not subwords.** XGrammar grammar is built from escaped attested target *surface* tokens/lexical units. Post-decode token-ID audit is mandatory. |
+| I3 | **`[UNK]` is deterministic.** It is inserted by `UNKDetector` outside model generation. The model never generates `[UNK:…]` text spontaneously. |
+| I4 | **TDD.** Every implementation task must have a failing test written *before* the implementation. Tests live in `tests/constrained_translation/`. |
+| I5 | **Surgical Pythonic changes.** No fine-tuning. Reuse existing `Query` concepts where sensible; do not couple to `benchmarks/openrouter_client.py`. |
+| I6 | **Offline tests require no GPU or model download.** A `FakeBackend` behind a narrow `BackendProtocol` satisfies all unit/integration tests. The real vLLM smoke test is the final task only. |
+| I7 | **No silent unconstrained fallback.** If grammar construction fails or XGrammar rejects a grammar, raise `GrammarBuildError`; the batch loop catches it, logs a hard failure, and moves on. Never silently drop the constraint. |
+
+---
+
+## 3. Repository Context
+
+### Existing assets to reuse
+
+| Asset | Location | What we reuse |
+|-------|----------|----------------|
+| `BM25Query` | `query/bm25query.py` | Semantic similarity retrieval (±5 semantic examples) |
+| `ContextQuery` | `query/contextquery.py` | Coverage-branching retrieval (±5 coverage examples) |
+| `QueryBase._load_files` | `query/base.py` | Aligned line loader: `source_verses`, `target_verses`, `valid_indices` |
+| `QueryBase._normalize_text` | `query/base.py` | Shared text normalisation |
+| `chrF_plus` | `metrics/chrf.py` | Optional post-hoc translation quality scoring |
+| `EBibleDownloader` | `ebible_downloader.py` | Corpus acquisition |
+
+### What we do NOT touch
+
+- `benchmarks/` — OpenRouter-specific; different deployment model.
+- `metrics/` — used read-only.
+- `query/` — used read-only via its public API.
+
+---
+
+## 4. Package Layout
+
+```
+constrained_translation/
+├── __init__.py
+├── protocol.py          # BackendProtocol (typing.Protocol) + data types
+├── fake_backend.py      # FakeBackend for offline tests
+├── vllm_backend.py      # VLLMBackend wrapping OpenAI-compat endpoint
+├── example_selector.py  # ExampleSelector: semantic + coverage retrieval
+├── vocab_extractor.py   # VocabExtractor: attested surface vocab from examples
+├── unk_detector.py      # UNKDetector: pre-decode span detection
+├── grammar_builder.py   # GrammarBuilder: per-request XGrammar grammar string
+├── prompt_builder.py    # PromptBuilder: few-shot prompt assembly
+├── token_auditor.py     # TokenAuditor: post-decode token-ID audit
+├── batch_runner.py      # BatchRunner: main orchestration loop
+├── logger.py            # JSONLLogger: coverage / retry / provenance logs
+├── rollup.py            # RollupStats: aggregate metrics across batch
+└── cli.py               # CLI entry point (argparse)
+
+tests/
+└── constrained_translation/
+    ├── conftest.py
+    ├── test_protocol.py
+    ├── test_fake_backend.py
+    ├── test_example_selector.py
+    ├── test_vocab_extractor.py
+    ├── test_unk_detector.py
+    ├── test_grammar_builder.py
+    ├── test_prompt_builder.py
+    ├── test_token_auditor.py
+    ├── test_batch_runner.py
+    ├── test_logger.py
+    ├── test_rollup.py
+    ├── test_cli.py
+    └── test_integration.py   # full pipeline with FakeBackend, no GPU
+```
+
+---
+
+## 5. Data Schemas
+
+All schemas live in `constrained_translation/protocol.py` as frozen `dataclass` objects (hashable where needed) plus a `typing.Protocol` for the backend.
+
+### 5.1 `AlignedExample`
+
+```python
+@dataclass(frozen=True)
+class AlignedExample:
+    verse_idx: int           # 0-based index into aligned corpus
+    source: str              # raw source verse text
+    target: str              # raw target verse text
+    selection_score: float   # BM25 / coverage score
+    selection_method: str    # "semantic" | "coverage"
+    evidence_tier: int       # always 1 (sentence co-occurrence) — see §6
+```
+
+### 5.2 `UNKSpan`
+
+```python
+@dataclass(frozen=True)
+class UNKSpan:
+    surface: str       # source-side span text (used verbatim in [UNK:surface])
+    start_char: int    # character offset in source_text
+    end_char: int
+```
+
+### 5.3 `TranslationRequest`
+
+```python
+@dataclass
+class TranslationRequest:
+    item_id: str
+    source_text: str
+    semantic_examples: tuple[AlignedExample, ...]    # ≤5 items
+    coverage_examples: tuple[AlignedExample, ...]   # ≤5 items
+    attested_vocab: frozenset[str]                   # surface tokens from target sides
+    unk_spans: tuple[UNKSpan, ...]                   # pre-detected uncovered spans
+    grammar_str: str                                  # XGrammar grammar string
+    prompt: str                                       # assembled few-shot prompt
+```
+
+### 5.4 `GenerationResult`
+
+```python
+@dataclass
+class GenerationResult:
+    text: str
+    token_ids: list[int]      # as returned by backend
+    prompt_tokens: int
+    output_tokens: int
+    generation_ms: float
+```
+
+### 5.5 `TokenAuditResult`
+
+```python
+@dataclass
+class TokenAuditResult:
+    passed: bool
+    violations: list[str]    # list of "token_id=N decoded='x' not in attested_vocab"
+```
+
+### 5.6 `TranslationResult`
+
+```python
+@dataclass
+class TranslationResult:
+    item_id: str
+    source_text: str
+    translation: str          # final text (may contain [UNK:…] markers)
+    coverage_pass: bool
+    retry_count: int          # 0 = first attempt succeeded
+    hard_failure: bool        # True if all retries exhausted
+    generation_result: GenerationResult | None
+    token_audit: TokenAuditResult | None
+    request: TranslationRequest
+    error: str | None         # exception message on hard failure
+```
+
+### 5.7 `BatchRollup`
+
+```python
+@dataclass
+class BatchRollup:
+    total_units: int
+    mean_tok_per_sec: float
+    coverage_pass_pct: float    # % items where coverage_pass=True
+    retry_pct: float            # % items with retry_count > 0
+    hard_failure_pct: float     # % items with hard_failure=True
+    token_audit_pass_pct: float # % items where audit passed
+    total_input_tokens: int
+    total_output_tokens: int
+```
+
+### 5.8 JSONL Log Record
+
+One JSON object per line in the output log file:
+
+```json
+{
+  "ts": "2026-07-09T16:00:00Z",
+  "event": "coverage_failure | retry | hard_failure | success | token_audit_violation",
+  "item_id": "GEN 1:1",
+  "retry_count": 0,
+  "coverage_pass": false,
+  "hard_failure": false,
+  "unk_spans": [{"surface": "selah", "start_char": 12, "end_char": 17}],
+  "examples": [
+    {"verse_idx": 42, "method": "semantic", "score": 3.14, "evidence_tier": 1},
+    ...
+  ],
+  "token_audit": {"passed": true, "violations": []},
+  "translation": "...",
+  "error": null
+}
+```
+
+---
+
+## 6. Evidence Tiers for Vocabulary Extraction
+
+**Critical — enforces invariant I1.**
+
+### Tier definitions
+
+| Tier | Name | Source | What it proves |
+|------|------|--------|----------------|
+| 0 | Word alignment | External word aligner (GIZA++, fast_align) | Probable word-to-word translation equivalences |
+| 1 | Sentence co-occurrence | Aligned sentence pairs (what eBible provides) | The source and target sentences are translations of each other. Does **not** prove any specific word maps to any specific target word. |
+| 2 | Type-level patterns | Statistical heuristics across many Tier-1 pairs | Soft probability estimates; still not proof of alignment |
+
+**Default for this system: Tier 1.**
+
+### What "attested target vocabulary" means at Tier 1
+
+Given a set of selected aligned sentence pairs (source_i, target_i):
+
+- `attested_vocab` = the set of whitespace-tokenised surface forms appearing in any `target_i`.
+- This does NOT mean each form translates a specific source word.
+- It means: **"these forms appear in translations of sentences related to this query; we permit the model to use them."**
+- The grammar acts as a *plausibility filter* (the model can only produce words seen in related translations), not as a word-alignment enforcer.
+
+### Documentation in code
+
+`VocabExtractor` must carry a module-level docstring and inline comment on every public method that names the evidence tier and explicitly states the non-alignment guarantee. No comment may use the phrase "word alignment" without a qualifier like "this is NOT word alignment."
+
+---
+
+## 7. Component Specifications
+
+### 7.1 `BackendProtocol` (`protocol.py`)
+
+```python
+class BackendProtocol(Protocol):
+    def generate(
+        self,
+        prompt: str,
+        grammar: str,
+        max_tokens: int,
+        temperature: float = 0.0,
+    ) -> GenerationResult: ...
+
+    def tokenize(self, text: str) -> list[int]: ...
+
+    def decode_token(self, token_id: int) -> str: ...
+
+    def is_available(self) -> bool: ...
+```
+
+The protocol is narrow by design. `VLLMBackend` and `FakeBackend` are the only two implementations.
+
+---
+
+### 7.2 `FakeBackend` (`fake_backend.py`)
+
+- Constructor accepts `responses: dict[str, str]` mapping prompt prefix (first 60 chars) to canned response text.
+- `generate()` returns a `GenerationResult` with fake `token_ids` derived from a deterministic hash of the response text.
+- `tokenize()` splits on whitespace and maps each token to a stable integer via a built-in dict.
+- `decode_token()` reverses that map.
+- No external dependencies.
+
+**Test target:** `tests/constrained_translation/test_fake_backend.py`
+
+---
+
+### 7.3 `ExampleSelector` (`example_selector.py`)
+
+**Inputs:** source_file path, target_file path, source query text, optional exclude_idx.  
+**Output:** `tuple[AlignedExample, ...]` of at most `n_semantic + n_coverage` items.
+
+**Algorithm:**
+
+1. Instantiate `BM25Query(source_file, target_file, verbose=False)`.
+2. Call `bm25.search_by_text(query, top_k=n_semantic)` → semantic examples.
+3. Instantiate `ContextQuery(source_file, target_file, verbose=False)`.
+4. Call `ctx.search_by_text(query, top_k=n_coverage)` → coverage examples.
+5. De-duplicate by `verse_idx`; if a verse appears in both lists, keep the semantic entry.
+6. Return as `AlignedExample` objects with `evidence_tier=1`.
+
+**Defaults:** `n_semantic=5`, `n_coverage=5`.
+
+**Important:** `ExampleSelector` does not call any model. It is fully offline.
+
+**Test target:** `tests/constrained_translation/test_example_selector.py`  
+Uses two tiny in-memory temp files (5 verse pairs). No corpus download.
+
+---
+
+### 7.4 `VocabExtractor` (`vocab_extractor.py`)
+
+**Inputs:** `examples: Iterable[AlignedExample]`  
+**Output:** `frozenset[str]` of surface tokens from the target sides.
+
+**Algorithm:**
+
+1. For each example, split `example.target` into whitespace tokens.
+2. Optionally apply Unicode NFKC normalisation (same as `metrics/chrf.py`).
+3. Include punctuation tokens as separate entries.
+4. Return the union as a frozenset.
+
+**Evidence tier docstring requirement:** Every public method must state Tier 1 and non-alignment guarantee (see §6).
+
+**Test target:** `tests/constrained_translation/test_vocab_extractor.py`
+
+---
+
+### 7.5 `UNKDetector` (`unk_detector.py`)
+
+**Inputs:** `source_text: str`, `attested_vocab: frozenset[str]`  
+**Output:** `tuple[UNKSpan, ...]`
+
+**Algorithm (Tier-1 conservative approach):**
+
+1. Tokenise `source_text` by whitespace.
+2. Normalise each token with NFKC + lowercase.
+3. A source token is *covered* if its normalised form appears in `{t.lower() for t in attested_vocab}`.
+4. Identify contiguous runs of uncovered tokens; merge adjacent uncovered tokens into a single span.
+5. Return one `UNKSpan` per contiguous run, capturing the original surface text and character offsets.
+
+**Invariant I3:** UNKDetector never calls the model. Its output is injected into the prompt and grammar independently of generation.
+
+**Test target:** `tests/constrained_translation/test_unk_detector.py`
+
+---
+
+### 7.6 `GrammarBuilder` (`grammar_builder.py`)
+
+**Inputs:** `attested_vocab: frozenset[str]`, `unk_spans: tuple[UNKSpan, ...]`  
+**Output:** `str` — an XGrammar grammar string
+
+**Grammar design (BNF/EBNF targeting XGrammar):**
+
+```
+translation ::= segment+
+segment      ::= attested_token | unk_marker | punctuation | WS
+attested_token ::= "word1" | "word2" | ... (one alternative per surface form)
+unk_marker  ::= "[UNK:" unk_surface "]"
+unk_surface ::= "span1" | "span2" | ...  (the pre-identified UNK surface texts)
+punctuation ::= "." | "," | "!" | "?" | ";" | ":" | "'" | "\""
+WS          ::= " "+
+```
+
+**Rules:**
+
+- Each attested surface token is included **verbatim** after regex-escaping.
+- `[UNK:…]` alternatives are included for each detected `UNKSpan.surface`.
+- Grammar must also allow a sentence-final newline `\n?`.
+- If `attested_vocab` is empty after extraction (degenerate corpus), raise `GrammarBuildError`.
+- Grammar strings must not contain raw subword pieces from the tokenizer vocabulary — only surface-level orthographic tokens.
+
+**Raises:** `GrammarBuildError(item_id, reason)` — never silently falls back.
+
+**Test target:** `tests/constrained_translation/test_grammar_builder.py`  
+Tests include: empty vocab raises, special chars are escaped, UNK markers are present, grammar parses with a dummy XGrammar validator mock.
+
+---
+
+### 7.7 `PromptBuilder` (`prompt_builder.py`)
+
+**Inputs:** `TranslationRequest`  
+**Output:** `str` — the assembled prompt
+
+**Prompt template:**
+
+```
+You are a translator. Translate the source sentence into the target language.
+Only use vocabulary attested in the examples. Uncovered spans are already marked as [UNK:span].
+
+Examples:
+[Source]: {example.source}
+[Translation]: {example.target}
+...
+
+Now translate:
+[Source]: {source_with_unk_markers_inserted}
+[Translation]:
+```
+
+**Rules:**
+
+- Examples are ordered: semantic examples first, then coverage examples.
+- UNK spans are inserted into the source text in the prompt (replacing raw surface with `[UNK:surface]`).
+- No example may appear twice.
+- The template is a module-level constant so tests can inspect it.
+
+**Test target:** `tests/constrained_translation/test_prompt_builder.py`
+
+---
+
+### 7.8 `TokenAuditor` (`token_auditor.py`)
+
+**Inputs:** `token_ids: list[int]`, `attested_vocab: frozenset[str]`, `backend: BackendProtocol`, `unk_spans: tuple[UNKSpan, ...]`  
+**Output:** `TokenAuditResult`
+
+**Algorithm:**
+
+1. For each `token_id` in `token_ids`:
+   a. Call `backend.decode_token(token_id)` → `decoded_str`.
+   b. Strip and check if `decoded_str` (after NFKC normalisation) is a substring of or equal to a token in `attested_vocab`, or forms part of a valid `[UNK:…]` marker, or is purely punctuation/whitespace.
+   c. If none of the above: record a violation.
+2. Return `TokenAuditResult(passed=len(violations)==0, violations=violations)`.
+
+**Note:** This is a best-effort audit at the surface-string level. Subword tokens that together form an attested word are individually checked against `attested_vocab` components. The audit is logged; it does not by itself trigger a retry (retries are coverage-driven). Violations are recorded for analysis.
+
+**Test target:** `tests/constrained_translation/test_token_auditor.py`
+
+---
+
+### 7.9 `BatchRunner` (`batch_runner.py`)
+
+**Inputs:**
+- `items: list[tuple[str, str]]` — `(item_id, source_text)` pairs
+- `backend: BackendProtocol`
+- `corpus_source_file: str`, `corpus_target_file: str`
+- `max_retries: int = 2`
+- `logger: JSONLLogger`
+- `max_tokens: int = 256`
+- `n_semantic: int = 5`, `n_coverage: int = 5`
+
+**Output:** `tuple[list[TranslationResult], BatchRollup]`
+
+**Per-item loop:**
+
+```
+for item_id, source_text in items:
+    attempt = 0
+    result = None
+    while attempt <= max_retries:
+        1. ExampleSelector.select(source_text, exclude_idx) → examples
+        2. VocabExtractor.extract(examples) → attested_vocab
+        3. UNKDetector.detect(source_text, attested_vocab) → unk_spans
+        4. try:
+               GrammarBuilder.build(attested_vocab, unk_spans) → grammar_str
+           except GrammarBuildError:
+               log hard_failure; break
+        5. PromptBuilder.build(request) → prompt
+        6. try:
+               backend.generate(prompt, grammar_str, max_tokens) → gen_result
+           except BackendError:
+               log retry; attempt += 1; continue
+        7. coverage_pass = all unk_spans were addressed or no unk_spans exist
+        8. TokenAuditor.audit(gen_result.token_ids, attested_vocab, backend, unk_spans) → audit
+        9. logger.log(event, ...)
+        10. if coverage_pass:
+                result = TranslationResult(coverage_pass=True, retry_count=attempt, ...)
+                break
+            elif attempt < max_retries:
+                logger.log("retry", ...)
+                attempt += 1
+            else:
+                result = TranslationResult(hard_failure=True, ...)
+                break
+    results.append(result)
+
+rollup = RollupStats.compute(results)
+return results, rollup
+```
+
+**Coverage pass definition:** A result passes coverage iff:
+- The model output does not contain any raw source-language token that was listed in `unk_spans` outside of an `[UNK:…]` wrapper, AND
+- The model output contains `[UNK:surface]` for every span in `unk_spans`.
+
+**Test target:** `tests/constrained_translation/test_batch_runner.py`
+
+---
+
+### 7.10 `JSONLLogger` (`logger.py`)
+
+**Constructor:** `JSONLLogger(log_path: str | Path)`  
+**Methods:** `log(event: str, **fields)` — writes one JSON line immediately (no buffering).
+
+Events: `coverage_failure`, `retry`, `hard_failure`, `success`, `token_audit_violation`, `grammar_build_error`.
+
+Each line contains at minimum:
+- `ts` (ISO-8601 UTC)
+- `event`
+- `item_id`
+- Any keyword fields passed
+
+**Test target:** `tests/constrained_translation/test_logger.py`
+
+---
+
+### 7.11 `RollupStats` (`rollup.py`)
+
+```python
+class RollupStats:
+    @staticmethod
+    def compute(results: list[TranslationResult]) -> BatchRollup: ...
+```
+
+`tok/s` = `total_output_tokens / (total_generation_ms / 1000)` across all non-hard-failure results.
+
+**Test target:** `tests/constrained_translation/test_rollup.py`
+
+---
+
+### 7.12 `cli.py`
+
+**Entry point:** `python -m constrained_translation.cli`
+
+```
+usage: python -m constrained_translation.cli
+  --source-file PATH       Aligned source corpus (.txt, one sentence per line)
+  --target-file PATH       Aligned target corpus (.txt, one sentence per line)
+  --input PATH             Input file: one source sentence per line (or JSONL with "id","text")
+  --output PATH            Output JSONL (one TranslationResult per line)
+  --log PATH               JSONL event log (default: output.log)
+  --rollup PATH            Rollup stats JSON (default: stdout)
+  --model-url URL          vLLM OpenAI-compat base URL (default: http://localhost:8000/v1)
+  --model-name STR         Model name for vLLM (default: Qwen/Qwen2.5-7B-Instruct)
+  --max-retries INT        (default: 2)
+  --max-tokens INT         (default: 256)
+  --n-semantic INT         Semantic example count (default: 5)
+  --n-coverage INT         Coverage example count (default: 5)
+  --fake-backend           Use FakeBackend with empty responses (for dry-run testing)
+  --batch-size INT         Items per tqdm progress chunk (default: 50)
+```
+
+**Test target:** `tests/constrained_translation/test_cli.py` — invokes via `subprocess.run` with `--fake-backend`.
+
+---
+
+## 8. Sequential Task Breakdown
+
+Each task follows TDD: write the failing test first, then implement, then confirm test passes.
+
+---
+
+### Task 1 — Package scaffold
+
+**Files:**
+- `constrained_translation/__init__.py` (empty, version = `"0.1.0"`)
+- `tests/constrained_translation/__init__.py`
+- `tests/constrained_translation/conftest.py` (shared fixtures: tiny 5-verse aligned pair files as `tmp_path` fixtures)
+
+**Test command:** `pytest tests/constrained_translation/ -x -q`  
+**Gate:** Import `import constrained_translation` without error.
+
+---
+
+### Task 2 — Protocol + FakeBackend
+
+**Files:**
+- `constrained_translation/protocol.py` — all dataclasses + `BackendProtocol`
+- `constrained_translation/fake_backend.py`
+- `tests/constrained_translation/test_fake_backend.py`
+
+**Tests (must fail first):**
+- `test_fake_backend_generate_returns_generation_result`
+- `test_fake_backend_tokenize_is_deterministic`
+- `test_fake_backend_decode_token_round_trips`
+- `test_fake_backend_is_available_returns_true`
+- `test_fake_backend_satisfies_protocol` — `isinstance` check via `runtime_checkable`
+
+**Test command:** `pytest tests/constrained_translation/test_fake_backend.py -x -v`
+
+---
+
+### Task 3 — ExampleSelector
+
+**Files:**
+- `constrained_translation/example_selector.py`
+- `tests/constrained_translation/test_example_selector.py`
+
+**Tests (must fail first):**
+- `test_selector_returns_at_most_n_semantic_plus_n_coverage`
+- `test_selector_deduplicates_by_verse_idx`
+- `test_selector_semantic_entries_have_method_semantic`
+- `test_selector_coverage_entries_have_method_coverage`
+- `test_selector_all_entries_have_evidence_tier_1`
+- `test_selector_excludes_query_verse_from_results`
+
+**Test command:** `pytest tests/constrained_translation/test_example_selector.py -x -v`  
+**Note:** Uses `conftest.py` tiny-corpus tmp files; no corpus download.
+
+---
+
+### Task 4 — VocabExtractor
+
+**Files:**
+- `constrained_translation/vocab_extractor.py`
+- `tests/constrained_translation/test_vocab_extractor.py`
+
+**Tests (must fail first):**
+- `test_extractor_returns_frozenset`
+- `test_extractor_includes_all_target_tokens`
+- `test_extractor_no_source_tokens_included`
+- `test_extractor_normalises_with_nfkc`
+- `test_extractor_empty_examples_returns_empty_frozenset`
+- `test_extractor_docstring_mentions_evidence_tier` — `inspect.getdoc` assertion
+
+**Test command:** `pytest tests/constrained_translation/test_vocab_extractor.py -x -v`
+
+---
+
+### Task 5 — UNKDetector
+
+**Files:**
+- `constrained_translation/unk_detector.py`
+- `tests/constrained_translation/test_unk_detector.py`
+
+**Tests (must fail first):**
+- `test_unk_detector_no_spans_when_all_covered`
+- `test_unk_detector_single_uncovered_token`
+- `test_unk_detector_adjacent_uncovered_tokens_merged`
+- `test_unk_detector_character_offsets_are_correct`
+- `test_unk_detector_surface_text_is_original_not_normalised`
+- `test_unk_detector_empty_source_returns_empty`
+- `test_unk_detector_is_deterministic` — same call twice returns identical output
+
+**Test command:** `pytest tests/constrained_translation/test_unk_detector.py -x -v`
+
+---
+
+### Task 6 — GrammarBuilder
+
+**Files:**
+- `constrained_translation/grammar_builder.py` (includes `GrammarBuildError`)
+- `tests/constrained_translation/test_grammar_builder.py`
+
+**Tests (must fail first):**
+- `test_grammar_builder_empty_vocab_raises_grammar_build_error`
+- `test_grammar_builder_output_is_string`
+- `test_grammar_builder_attested_tokens_present_in_grammar`
+- `test_grammar_builder_unk_markers_present_in_grammar`
+- `test_grammar_builder_special_chars_escaped`
+- `test_grammar_builder_no_raw_subword_pieces` — asserts grammar contains no token IDs, only surface strings
+- `test_grammar_build_error_carries_item_id`
+
+**Test command:** `pytest tests/constrained_translation/test_grammar_builder.py -x -v`  
+**Note:** Tests do NOT import xgrammar; they inspect the grammar string directly. XGrammar integration is deferred to Task 9 / vLLM smoke test.
+
+---
+
+### Task 7 — PromptBuilder
+
+**Files:**
+- `constrained_translation/prompt_builder.py`
+- `tests/constrained_translation/test_prompt_builder.py`
+
+**Tests (must fail first):**
+- `test_prompt_builder_contains_source_text`
+- `test_prompt_builder_contains_all_example_sources`
+- `test_prompt_builder_contains_all_example_targets`
+- `test_prompt_builder_unk_spans_replaced_in_prompt_source`
+- `test_prompt_builder_semantic_examples_before_coverage`
+- `test_prompt_builder_no_duplicate_examples`
+- `test_prompt_builder_ends_with_translation_cue`
+
+**Test command:** `pytest tests/constrained_translation/test_prompt_builder.py -x -v`
+
+---
+
+### Task 8 — TokenAuditor
+
+**Files:**
+- `constrained_translation/token_auditor.py`
+- `tests/constrained_translation/test_token_auditor.py`
+
+**Tests (must fail first):**
+- `test_auditor_pass_when_all_tokens_attested`
+- `test_auditor_fail_when_foreign_token_present`
+- `test_auditor_unk_markers_count_as_passing`
+- `test_auditor_punctuation_passes`
+- `test_auditor_whitespace_passes`
+- `test_auditor_violations_list_is_populated`
+- `test_auditor_uses_fake_backend_decode`
+
+**Test command:** `pytest tests/constrained_translation/test_token_auditor.py -x -v`
+
+---
+
+### Task 9 — BatchRunner (core loop)
+
+**Files:**
+- `constrained_translation/batch_runner.py`
+- `tests/constrained_translation/test_batch_runner.py`
+
+**Tests (must fail first):**
+- `test_runner_returns_result_per_item`
+- `test_runner_coverage_pass_on_clean_example`
+- `test_runner_retry_on_coverage_failure`
+- `test_runner_hard_failure_after_max_retries`
+- `test_runner_grammar_build_error_logs_hard_failure`
+- `test_runner_no_unconstrained_fallback` — asserts `FakeBackend.generate` was always called with non-empty grammar
+- `test_runner_retry_count_increments`
+
+**Test command:** `pytest tests/constrained_translation/test_batch_runner.py -x -v`
+
+---
+
+### Task 10 — JSONLLogger
+
+**Files:**
+- `constrained_translation/logger.py`
+- `tests/constrained_translation/test_logger.py`
+
+**Tests (must fail first):**
+- `test_logger_creates_file`
+- `test_logger_writes_valid_json_per_line`
+- `test_logger_ts_is_iso8601_utc`
+- `test_logger_all_required_fields_present`
+- `test_logger_multiple_events_multiple_lines`
+
+**Test command:** `pytest tests/constrained_translation/test_logger.py -x -v`
+
+---
+
+### Task 11 — RollupStats
+
+**Files:**
+- `constrained_translation/rollup.py`
+- `tests/constrained_translation/test_rollup.py`
+
+**Tests (must fail first):**
+- `test_rollup_total_units`
+- `test_rollup_coverage_pass_pct`
+- `test_rollup_retry_pct`
+- `test_rollup_hard_failure_pct`
+- `test_rollup_tok_per_sec_excludes_hard_failures`
+- `test_rollup_token_audit_pass_pct`
+- `test_rollup_all_zeros_on_empty_results`
+
+**Test command:** `pytest tests/constrained_translation/test_rollup.py -x -v`
+
+---
+
+### Task 12 — CLI
+
+**Files:**
+- `constrained_translation/cli.py`
+- `tests/constrained_translation/test_cli.py`
+
+**Tests (must fail first):**
+- `test_cli_help_exits_zero`
+- `test_cli_fake_backend_runs_end_to_end`
+- `test_cli_produces_output_jsonl`
+- `test_cli_produces_log_jsonl`
+- `test_cli_prints_rollup_json`
+- `test_cli_missing_required_args_exits_nonzero`
+
+**Test command:** `pytest tests/constrained_translation/test_cli.py -x -v`
+
+---
+
+### Task 13 — Integration test (FakeBackend, no GPU)
+
+**Files:**
+- `tests/constrained_translation/test_integration.py`
+
+**Tests (must fail first):**
+- `test_full_pipeline_3_items_fake_backend` — runs BatchRunner end-to-end with FakeBackend + tiny corpus.
+- `test_full_pipeline_unk_span_appears_in_translation`
+- `test_full_pipeline_log_has_one_record_per_item`
+- `test_full_pipeline_rollup_totals_match_results`
+- `test_full_pipeline_grammar_never_empty_string`
+
+**Test command:** `pytest tests/constrained_translation/test_integration.py -x -v`
+
+---
+
+### Task 14 — VLLMBackend + real vLLM smoke test
+
+**Files:**
+- `constrained_translation/vllm_backend.py`
+- `tests/constrained_translation/test_vllm_smoke.py` (skipped unless `VLLM_URL` env var is set)
+
+**VLLMBackend spec:**
+- Wraps OpenAI-compat client pointing at `model_url`.
+- `generate()` passes grammar via `extra_body={"guided_grammar": grammar_str}` (vLLM XGrammar API).
+- `tokenize()` calls `/tokenize` endpoint.
+- `decode_token()` calls `/detokenize` endpoint.
+- Raises `BackendError` (not `Exception`) on HTTP errors.
+- `is_available()` does a `/health` GET, returns bool.
+
+**Smoke test:**
+- `pytest tests/constrained_translation/test_vllm_smoke.py -x -v -m smoke`
+- Marked `@pytest.mark.smoke` — skipped in CI unless `VLLM_URL` is set.
+- Translates 3 Genesis 1:1-3 verses; asserts rollup `hard_failure_pct < 1.0`.
+
+**Test command:** `VLLM_URL=http://localhost:8000 pytest tests/constrained_translation/test_vllm_smoke.py -m smoke -v`
+
+---
+
+## 9. Pre-flight, Revision, and Abort Gates
+
+### Pre-flight (before starting any task)
+
+- [ ] `git status` clean on `feat/constrained-translation-loop`.
+- [ ] `pytest tests/` passes (existing tests unbroken).
+- [ ] `python -c "from query import BM25Query, ContextQuery"` succeeds.
+- [ ] `python -c "from metrics import chrF_plus"` succeeds.
+
+### Per-task revision gate
+
+After writing the failing test and before writing implementation:
+
+- [ ] The new test file is syntactically valid (`python -m py_compile`).
+- [ ] `pytest <test_file> -x` fails with `ImportError` or `AttributeError` (not `SyntaxError`).
+
+After writing implementation:
+
+- [ ] `pytest <test_file> -x -v` passes.
+- [ ] `pytest tests/constrained_translation/ -x -q` passes (no regressions).
+- [ ] `python -m py_compile constrained_translation/<module>.py` clean.
+
+### Invariant spot-checks (every task)
+
+- [ ] No new call to `benchmarks/openrouter_client.py` introduced.
+- [ ] No file in `query/` or `metrics/` modified.
+- [ ] No new code uses phrase "word alignment" without the qualifier "this is NOT".
+- [ ] No `generate()` call has `grammar=""` or `grammar=None`.
+
+### Abort conditions
+
+Abort the current task and file an issue if:
+
+- A test cannot be made to pass without modifying existing `query/` or `metrics/` code in a breaking way.
+- XGrammar rejects the grammar format for >80% of test grammars during Task 14.
+- vLLM's `/tokenize` or `/detokenize` endpoints are absent (need to adjust `token_auditor` to decode via generate with single-token prompts — document the workaround).
+
+---
+
+## 10. Acceptance Criteria
+
+The implementation is complete when all of the following hold:
+
+1. **All offline tests pass without GPU:**  
+   `pytest tests/constrained_translation/ -x -q --ignore=tests/constrained_translation/test_vllm_smoke.py`  
+   exits 0.
+
+2. **No unconstrained generation path exists:**  
+   `grep -rn 'grammar=""' constrained_translation/` returns no results.  
+   `grep -rn "grammar=''" constrained_translation/` returns no results.
+
+3. **Evidence tier is documented:**  
+   `grep -rn "evidence_tier" constrained_translation/vocab_extractor.py` returns ≥ 2 hits.  
+   `grep -rn "NOT word alignment" constrained_translation/vocab_extractor.py` returns ≥ 1 hit.
+
+4. **`[UNK]` is only inserted by `UNKDetector`:**  
+   `grep -rn "\[UNK:" constrained_translation/` — all hits are in `unk_detector.py`, `prompt_builder.py`, `grammar_builder.py`, and `batch_runner.py` (injecting the result). Zero hits in `vllm_backend.py` or `fake_backend.py`.
+
+5. **Token audit is always run:**  
+   `grep -rn "token_auditor" constrained_translation/batch_runner.py` — audit is called unconditionally after every successful generation.
+
+6. **JSONL log is written for every item:**  
+   Integration test asserts `len(log_lines) == len(input_items)`.
+
+7. **Rollup contains all required fields:**  
+   `BatchRollup.__dataclass_fields__` matches spec in §5.7.
+
+8. **CLI smoke-runs end-to-end:**  
+   `python -m constrained_translation.cli --fake-backend --source-file <tmp> --target-file <tmp> --input <tmp> --output /dev/null` exits 0 and prints valid JSON rollup.
+
+9. **vLLM smoke test passes (manual gate):**  
+   With vLLM running locally: `VLLM_URL=http://localhost:8000 pytest tests/constrained_translation/test_vllm_smoke.py -m smoke` exits 0 with `hard_failure_pct < 1.0`.
+
+---
+
+## 11. Dependencies & Environment
+
+### New runtime dependencies
+
+Add to `requirements.txt`:
+
+```
+xgrammar>=0.1.0          # constrained generation grammar engine
+transformers>=4.40.0     # tokenizer for post-decode audit (CPU-only mode)
+```
+
+### New dev/test dependencies
+
+Add to `requirements-dev.txt` (create if absent):
+
+```
+pytest>=8.0
+pytest-timeout>=2.3
+```
+
+### Environment variables
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `VLLM_URL` | No | `http://localhost:8000` | vLLM base URL for smoke test |
+| `VLLM_MODEL` | No | `Qwen/Qwen2.5-7B-Instruct` | Model name for vLLM calls |
+
+### No-GPU guarantee
+
+- `xgrammar` grammar *compilation* (string validation) is CPU-only.
+- `transformers` tokenizer can be loaded in offline mode (`TRANSFORMERS_OFFLINE=1`) for the token auditor.
+- The `FakeBackend` never instantiates any transformer.
+- All Tasks 1–13 tests must pass in an environment with `TRANSFORMERS_OFFLINE=1` set and no GPU.
+
+---
+
+*End of plan. Implementation proceeds task-by-task in order, TDD-first.*
