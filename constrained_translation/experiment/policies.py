@@ -37,7 +37,9 @@ silver_policy(candidates, translated_source_texts)
     BM25 parameters: k1=1.5, b=0.75 (same as BM25Query defaults).
     The pool documents are each translated_source_text treated as one
     document; the candidate is the query.  IDF is corpus-based over the
-    translated pool documents; TF is over the candidate (query-side).
+    translated pool documents; TF is per-term frequency within each pool
+    document (document-side).  The candidate source text supplies the query
+    terms whose BM25 contributions are summed across all pool documents.
 
 golden_policy(candidates, project_slice, known_types)
     Three-level ordering (best → worst):
@@ -203,14 +205,19 @@ def _bm25_score_candidate_vs_pool(
     k1: float = 1.5,
     b: float = 0.75,
 ) -> float:
-    """Source-side BM25 score: candidate as query, pool as corpus.
+    """Source-side BM25 score: candidate as query, pool documents as corpus.
+
+    Each translated source text in ``pool_texts`` is treated as one corpus
+    document.  Term frequency (TF) is counted within each pool document;
+    the candidate text supplies the query terms.  IDF is computed over the
+    set of pool documents.  BM25 contributions are summed across all documents.
 
     Parameters
     ----------
     candidate_text:
-        The candidate source text (query).
+        The candidate source text (query — provides query terms).
     pool_texts:
-        Translated source texts forming the corpus.
+        Translated source texts forming the corpus (documents — provide TF).
     k1, b:
         BM25 parameters (matching BM25Query defaults).
 

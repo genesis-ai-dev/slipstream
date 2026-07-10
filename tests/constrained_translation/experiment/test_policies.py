@@ -331,22 +331,31 @@ class TestSilverPolicy:
         )
 
     def test_tie_broken_by_bm25_similarity(self):
-        """When known-fraction ties, BM25 similarity to translated pool breaks the tie."""
-        # Both have 0/N known (empty pool), so BM25 to empty pool → all zero → corpus_idx wins
-        # To test BM25 we need a non-empty pool
-        # Translated pool: "alpha beta gamma"
-        # c0: corpus_idx=0, "delta epsilon" — 0 overlap with translated pool
-        # c1: corpus_idx=1, "alpha beta delta" — 2 token overlap → higher BM25
-        # c2: corpus_idx=2, "alpha beta gamma" — 3 token overlap → highest BM25
-        # All have fraction 0/N known
-        translated = ["alpha beta gamma"]
-        c0 = _candidate(0, "delta epsilon zeta")
-        c1 = _candidate(1, "alpha beta delta")
-        c2 = _candidate(2, "alpha beta gamma")  # identical to translated — highest similarity
+        """When known-fraction ties exactly, BM25 similarity to translated pool breaks the tie.
+
+        Pool: "alpha alpha beta"  → known_types = {alpha, beta}
+              Pool TF: alpha=2, beta=1 — alpha has higher TF, so it scores higher in BM25.
+
+        All three candidates have *identical* known-occurrence fraction = 1/2:
+          c0 corpus_idx=0: "beta unknownA"   → 1 known (beta),  1 unknown → frac=0.50
+          c1 corpus_idx=1: "beta unknownB"   → 1 known (beta),  1 unknown → frac=0.50
+          c2 corpus_idx=2: "alpha unknownC"  → 1 known (alpha), 1 unknown → frac=0.50
+
+        BM25 scores differ because pool TF(alpha)=2 > TF(beta)=1:
+          BM25(c2) > BM25(c0) = BM25(c1)
+
+        So Level 1 (fraction) cannot determine the winner; Level 2 (BM25) must.
+        c2 wins on BM25; c0 vs c1 fall through to Level 3 corpus_idx (c0 < c1).
+        """
+        translated = ["alpha alpha beta"]   # TF: alpha=2, beta=1
+        c0 = _candidate(0, "beta unknownA")   # frac=1/2, BM25~0.288
+        c1 = _candidate(1, "beta unknownB")   # frac=1/2, BM25~0.288
+        c2 = _candidate(2, "alpha unknownC")  # frac=1/2, BM25~0.411 → wins
 
         chosen = silver_policy([c0, c1, c2], translated_source_texts=translated)
         assert chosen.corpus_idx == 2, (
-            f"Expected c2 (highest BM25), got corpus_idx={chosen.corpus_idx}"
+            f"Expected c2 (equal fraction 1/2, highest BM25 via higher pool TF for 'alpha'), "
+            f"got corpus_idx={chosen.corpus_idx}"
         )
 
     def test_stable_tiebreak_lowest_corpus_idx(self):
@@ -394,21 +403,62 @@ class TestSilverPolicy:
         )
 
     def test_bm25_tie_level(self):
+        """BM25 tiebreak: when two candidates have equal known-fraction, higher BM25 wins.
+
+        Pool: "alpha alpha beta"  → known_types = {alpha, beta}
+              Pool TF: alpha=2, beta=1.
+
+        Candidates – all with identical known-occurrence fraction = 1/2:
+          c10 corpus_idx=10: "beta xray"   → 1/2 known, BM25 uses beta (TF=1 in pool)
+          c20 corpus_idx=20: "alpha xray"  → 1/2 known, BM25 uses alpha (TF=2 in pool) → higher
+          c30 corpus_idx=30: "beta xray"   → same as c10
+
+        Level 1 cannot separate them (all 0.50).  Level 2 BM25 selects c20.
         """
-        BM25 tiebreak: when two candidates have equal known-fraction (both 0),
-        the one with higher BM25 score vs. translated pool wins.
-        """
-        translated = ["the quick brown fox"]
-        # c10: overlaps "quick fox" — some BM25 signal
-        # c20: overlaps "the quick brown fox" — max overlap → highest BM25
-        # c30: no overlap
-        c10 = _candidate(10, "quick fox jumps")
-        c20 = _candidate(20, "the quick brown fox")
-        c30 = _candidate(30, "completely different text")
+        translated = ["alpha alpha beta"]  # TF: alpha=2, beta=1
+        c10 = _candidate(10, "beta xray")    # frac=1/2, BM25 ~0.288
+        c20 = _candidate(20, "alpha xray")   # frac=1/2, BM25 ~0.411 → wins
+        c30 = _candidate(30, "beta xray")    # frac=1/2, BM25 ~0.288
 
         chosen = silver_policy([c10, c20, c30], translated_source_texts=translated)
         assert chosen.corpus_idx == 20, (
-            f"Expected c20 (highest BM25 overlap), got corpus_idx={chosen.corpus_idx}"
+            f"Expected c20 (equal fraction 1/2, highest BM25 via pool TF(alpha)=2), "
+            f"got corpus_idx={chosen.corpus_idx}"
+        )
+
+    def test_bm25_level2_actually_used(self, monkeypatch):
+        """Regression: BM25 (Level 2) is genuinely exercised, not shadowed by Level 1.
+
+        Setup: three candidates with *identical* known-occurrence fraction (1/2).
+        Real BM25 → c2 wins (alpha has higher pool TF → higher score).
+        Zeroed BM25 → c0 wins (all BM25=0.0, Level 3 corpus_idx picks lowest=0).
+
+        Monkeypatching _bm25_score_candidate_vs_pool to always return 0.0 changes
+        the winner, proving that Level 2 BM25 is what breaks the tie in the real call.
+        """
+        import constrained_translation.experiment.policies as pol
+
+        translated = ["alpha alpha beta"]   # TF: alpha=2, beta=1
+        c0 = _candidate(0, "beta unknownA")   # frac=1/2, BM25 lower
+        c1 = _candidate(1, "beta unknownB")   # frac=1/2, BM25 same as c0
+        c2 = _candidate(2, "alpha unknownC")  # frac=1/2, BM25 higher → real winner
+
+        # Real call: c2 wins because BM25(alpha) > BM25(beta)
+        real_winner = silver_policy([c0, c1, c2], translated_source_texts=translated)
+        assert real_winner.corpus_idx == 2, (
+            f"Pre-patch sanity: expected c2, got {real_winner.corpus_idx}"
+        )
+
+        # Zero out BM25: all candidates score 0.0 → Level 3 (lowest corpus_idx) decides
+        monkeypatch.setattr(pol, "_bm25_score_candidate_vs_pool", lambda *a, **kw: 0.0)
+        zeroed_winner = silver_policy([c0, c1, c2], translated_source_texts=translated)
+        assert zeroed_winner.corpus_idx == 0, (
+            f"Zeroed BM25: expected c0 (lowest idx since all BM25=0), got {zeroed_winner.corpus_idx}"
+        )
+
+        # The winner changed → BM25 was the decisive factor in the real call.
+        assert real_winner.corpus_idx != zeroed_winner.corpus_idx, (
+            "Zeroing BM25 must change the winner; otherwise BM25 Level 2 is not exercised."
         )
 
     def test_no_target_access(self):
