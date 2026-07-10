@@ -331,16 +331,62 @@ def test_grammar_builder_rejects_carriage_return():
     assert exc_info.value.item_id == "CTRL 1:3"
 
 
-def test_grammar_builder_rejects_bidi_control():
-    """A token containing a BiDi control character (U+200F, Cf) must raise GrammarBuildError."""
+def test_grammar_builder_allows_right_to_left_mark():
+    """U+200F RIGHT-TO-LEFT MARK (Cf) must be ACCEPTED — attested in ckb (Central Kurdish) tokens.
+
+    Real ckb tokens from the eBible corpus contain U+200F RLM as a legitimate
+    bidi-marking character in right-to-left script text.  Rejecting it causes
+    hard failures at grammar-build time for Kurdish translation requests.
+
+    U+200F is NOT a bidi embedding/override/isolate (U+202A-E, U+2066-9) and
+    poses no redirection-attack risk inside EBNF literals.
+    """
     m = _import_builder()
-    # U+200F RIGHT-TO-LEFT MARK (category Cf)
-    vocab = frozenset(["word\u200f"])
-    with pytest.raises(m.GrammarBuildError) as exc_info:
-        m.GrammarBuilder().build(vocab, item_id="CTRL 1:4")
-    assert exc_info.value.item_id == "CTRL 1:4"
-    # Must mention the character codepoint or Cf category
-    assert "200F" in exc_info.value.reason.upper() or "Cf" in exc_info.value.reason
+    # Minimal token: just the RLM character (attested as a standalone token)
+    tok = "word\u200f"
+    vocab = frozenset([tok])
+    grammar = m.GrammarBuilder().build(vocab, item_id="CKB 1:1")
+    assert isinstance(grammar, str)
+    assert len(grammar) > 0
+
+
+def test_grammar_builder_allows_left_to_right_mark():
+    """U+200E LEFT-TO-RIGHT MARK (Cf) must be ACCEPTED — symmetry with U+200F RLM.
+
+    LRM is the directional counterpart of RLM and appears in bilingual and
+    mixed-script corpus tokens.  Both marks are non-embedding, non-override,
+    non-isolate and are safe inside EBNF string literals.
+    """
+    m = _import_builder()
+    tok = "\u200eword"
+    vocab = frozenset([tok])
+    grammar = m.GrammarBuilder().build(vocab, item_id="LRM 1:1")
+    assert isinstance(grammar, str)
+    assert len(grammar) > 0
+
+
+def test_grammar_builder_allows_ckb_realistic_token():
+    """Realistic Central Kurdish (ckb) token with U+200F must compile successfully.
+
+    ckb Bible text uses RIGHT-TO-LEFT MARK as a bidi boundary marker.  Tokens
+    containing U+200F must appear in the generated grammar string.
+    """
+    m = _import_builder()
+    # Simulated ckb token: Arabic/Kurdish word + RLM bidi mark
+    tok = "\u06a9\u062a\u06ce\u200f"   # كتێ + RLM
+    vocab = frozenset([tok, "\u0626\u06d5\u0648"])  # + another ckb word
+    grammar = m.GrammarBuilder().build(vocab, item_id="CKB 2:1")
+    assert isinstance(grammar, str)
+    assert "\u06a9\u062a\u06ce" in grammar
+
+
+def test_grammar_builder_allows_lrm_rlm_together():
+    """A token containing both U+200E LRM and U+200F RLM must be ACCEPTED."""
+    m = _import_builder()
+    tok = "\u200etest\u200f"
+    vocab = frozenset([tok])
+    grammar = m.GrammarBuilder().build(vocab, item_id="BIDI MARK 1:1")
+    assert isinstance(grammar, str)
 
 
 def test_grammar_builder_control_char_error_carries_item_id():
@@ -661,6 +707,97 @@ def test_grammar_builder_cf_allowlist_does_not_weaken_cc_rejection():
         m.GrammarBuilder().build(vocab, item_id="CC 1:1")
     assert exc_info.value.item_id == "CC 1:1"
     assert "Cc" in exc_info.value.reason
+
+
+# ---------------------------------------------------------------------------
+# Bidi embedding/override/isolate range — all must continue to be rejected
+# U+202A LEFT-TO-RIGHT EMBEDDING
+# U+202B RIGHT-TO-LEFT EMBEDDING
+# U+202C POP DIRECTIONAL FORMATTING
+# U+202D LEFT-TO-RIGHT OVERRIDE
+# U+202E RIGHT-TO-LEFT OVERRIDE
+# U+2066 LEFT-TO-RIGHT ISOLATE
+# U+2067 RIGHT-TO-LEFT ISOLATE
+# U+2068 FIRST STRONG ISOLATE
+# U+2069 POP DIRECTIONAL ISOLATE
+# ---------------------------------------------------------------------------
+
+def test_grammar_builder_still_rejects_ltr_embedding_202a():
+    """U+202A LEFT-TO-RIGHT EMBEDDING (Cf) must be rejected — bidi attack vector."""
+    m = _import_builder()
+    vocab = frozenset(["word\u202a"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 2:1")
+    assert exc_info.value.item_id == "BIDI 2:1"
+    assert "Cf" in exc_info.value.reason or "202A" in exc_info.value.reason.upper()
+
+
+def test_grammar_builder_still_rejects_pop_directional_202c():
+    """U+202C POP DIRECTIONAL FORMATTING (Cf) must be rejected."""
+    m = _import_builder()
+    vocab = frozenset(["\u202cword"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 2:2")
+    assert exc_info.value.item_id == "BIDI 2:2"
+    assert "Cf" in exc_info.value.reason or "202C" in exc_info.value.reason.upper()
+
+
+def test_grammar_builder_still_rejects_ltr_isolate_2066():
+    """U+2066 LEFT-TO-RIGHT ISOLATE (Cf) must be rejected — bidi isolate attack vector."""
+    m = _import_builder()
+    vocab = frozenset(["\u2066evil"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 3:1")
+    assert exc_info.value.item_id == "BIDI 3:1"
+    assert "Cf" in exc_info.value.reason or "2066" in exc_info.value.reason.upper()
+
+
+def test_grammar_builder_still_rejects_rtl_isolate_2067():
+    """U+2067 RIGHT-TO-LEFT ISOLATE (Cf) must be rejected."""
+    m = _import_builder()
+    vocab = frozenset(["\u2067word"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 3:2")
+    assert exc_info.value.item_id == "BIDI 3:2"
+    assert "Cf" in exc_info.value.reason or "2067" in exc_info.value.reason.upper()
+
+
+def test_grammar_builder_still_rejects_first_strong_isolate_2068():
+    """U+2068 FIRST STRONG ISOLATE (Cf) must be rejected."""
+    m = _import_builder()
+    vocab = frozenset(["word\u2068"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 3:3")
+    assert exc_info.value.item_id == "BIDI 3:3"
+    assert "Cf" in exc_info.value.reason or "2068" in exc_info.value.reason.upper()
+
+
+def test_grammar_builder_still_rejects_pop_directional_isolate_2069():
+    """U+2069 POP DIRECTIONAL ISOLATE (Cf) must be rejected."""
+    m = _import_builder()
+    vocab = frozenset(["\u2069word"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 3:4")
+    assert exc_info.value.item_id == "BIDI 3:4"
+    assert "Cf" in exc_info.value.reason or "2069" in exc_info.value.reason.upper()
+
+
+def test_grammar_builder_rlm_lrm_not_in_bidi_attack_range():
+    """Confirm U+200E/F are outside the rejected bidi embedding/override/isolate ranges.
+
+    U+200E LRM and U+200F RLM are at 0x200E/F, well below the
+    embedding/override range (0x202A-202E) and the isolate range (0x2066-2069).
+    This test documents that the allowlist is grounded in distinct codepoints,
+    not a broad category override.
+    """
+    assert ord("\u200e") == 0x200E   # LRM — in allowlist
+    assert ord("\u200f") == 0x200F   # RLM — in allowlist
+    # Embedding/override range
+    assert ord("\u202a") == 0x202A   # LRE — forbidden
+    assert ord("\u202e") == 0x202E   # RLO — forbidden
+    # Isolate range
+    assert ord("\u2066") == 0x2066   # LRI — forbidden
+    assert ord("\u2069") == 0x2069   # PDI — forbidden
 
 
 # ---------------------------------------------------------------------------

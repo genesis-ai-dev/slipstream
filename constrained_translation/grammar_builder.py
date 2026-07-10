@@ -184,12 +184,20 @@ class GrammarBuilder:
         #   U+200B  ZERO WIDTH SPACE          — Burmese (mya) word-boundary marker
         #   U+200C  ZERO WIDTH NON-JOINER     — Devanagari / Indic scripts
         #   U+200D  ZERO WIDTH JOINER         — Nepali (npi) conjunct consonants
-        # All other Cf characters (bidi overrides, soft-hyphen, language tags, …)
+        #   U+200E  LEFT-TO-RIGHT MARK        — attested in bilingual/mixed-script tokens
+        #   U+200F  RIGHT-TO-LEFT MARK        — attested in ckb (Central Kurdish) tokens
+        #
+        # All bidi embedding/override/isolate controls remain forbidden:
+        #   U+202A-E  (LRE, RLE, PDF, LRO, RLO)
+        #   U+2066-9  (LRI, RLI, FSI, PDI)
+        # Soft hyphen (U+00AD), language tags, and all other Cf characters also
         # remain forbidden.
         _CF_ALLOWLIST: frozenset[str] = frozenset({
             "\u200B",  # ZERO WIDTH SPACE
             "\u200C",  # ZERO WIDTH NON-JOINER
             "\u200D",  # ZERO WIDTH JOINER
+            "\u200E",  # LEFT-TO-RIGHT MARK  — attested in bilingual corpus tokens
+            "\u200F",  # RIGHT-TO-LEFT MARK  — attested in ckb tokens
         })
         _FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
         for tok in attested_vocab:

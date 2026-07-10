@@ -32,6 +32,7 @@ Design decisions
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
 import requests
@@ -87,6 +88,13 @@ class VLLMBackend:
         ``(connect_timeout, read_timeout)`` in seconds forwarded to every
         ``requests`` call.  Defaults to ``(10, 120)``.
     """
+
+    # Process-local bounded cache for decode_token().
+    # Key: (normalized_base_url, model, token_id) → str surface form.
+    # Maximum 8192 entries; oldest entry is evicted when the limit is reached.
+    # Only successful responses are stored; BackendError results are never cached.
+    _decode_token_cache: OrderedDict = OrderedDict()
+    _DECODE_TOKEN_CACHE_MAX: int = 8192
 
     def __init__(
         self,
@@ -272,6 +280,12 @@ class VLLMBackend:
     def decode_token(self, token_id: int) -> str:
         """Decode a single *token_id* to its surface string.
 
+        Results are memoised in a process-local class-level LRU/FIFO cache keyed
+        by ``(base_url, model, token_id)``.  At most 8192 entries are retained;
+        the oldest entry is evicted when the limit is reached.  Only successful
+        HTTP responses are cached; any ``BackendError`` is re-raised without
+        caching so a subsequent call will retry the network request.
+
         Parameters
         ----------
         token_id:
@@ -287,6 +301,14 @@ class VLLMBackend:
         BackendError
             On HTTP error, malformed response, or missing ``prompt`` key.
         """
+        cache_key = (self.base_url, self.model, token_id)
+        cached = VLLMBackend._decode_token_cache.get(cache_key)
+        if cached is not None:
+            # Move to end (LRU order) — safe even for FIFO as it has no effect
+            # on FIFO eviction correctness (oldest key stays oldest).
+            VLLMBackend._decode_token_cache.move_to_end(cache_key)
+            return cached
+
         payload = {
             "model": self.model,
             "tokens": [token_id],
@@ -301,7 +323,14 @@ class VLLMBackend:
                 f"Response missing 'prompt' key: {data!r}",
             )
 
-        return data["prompt"]
+        result = data["prompt"]
+
+        # Store in cache; evict oldest entry if capacity is exceeded.
+        VLLMBackend._decode_token_cache[cache_key] = result
+        if len(VLLMBackend._decode_token_cache) > VLLMBackend._DECODE_TOKEN_CACHE_MAX:
+            VLLMBackend._decode_token_cache.popitem(last=False)
+
+        return result
 
     def decode_tokens(self, token_ids: list[int]) -> str:
         """Decode a full sequence of *token_ids* to a surface string.

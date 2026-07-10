@@ -29,6 +29,24 @@ import requests
 
 
 # ---------------------------------------------------------------------------
+# Module-level autouse fixture — clear decode_token cache before every test
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_decode_token_cache():
+    """Flush the class-level decode_token cache before and after every test.
+
+    This prevents cross-test cache pollution without altering any test logic.
+    The cache is a private implementation detail; tests should observe only the
+    externally-visible behaviours (HTTP call counts, return values, errors).
+    """
+    from constrained_translation.vllm_backend import VLLMBackend
+    VLLMBackend._decode_token_cache.clear()
+    yield
+    VLLMBackend._decode_token_cache.clear()
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -707,3 +725,185 @@ class TestProtocolConformance:
         from constrained_translation.vllm_backend import VLLMBackend
         b = VLLMBackend(base_url="http://localhost:8000", model="m")
         assert callable(b.is_available)
+
+
+# ---------------------------------------------------------------------------
+# §13  decode_token() — process-local LRU/FIFO cache
+# ---------------------------------------------------------------------------
+
+class TestDecodeTokenCache:
+    """Process-local bounded cache for VLLMBackend.decode_token().
+
+    Key: (normalized base_url, model, token_id).
+    Max entries: 8192.  Successes only.  Failures must NOT be cached.
+    decode_tokens() (full-sequence) must remain uncached/per-call.
+    """
+
+    @staticmethod
+    def _clear_cache():
+        """Clear the class-level decode_token cache between tests."""
+        from constrained_translation.vllm_backend import VLLMBackend
+        VLLMBackend._decode_token_cache.clear()
+
+    # setup_method/teardown_method are intentionally omitted here;
+    # the module-level _clear_decode_token_cache autouse fixture handles cleanup.
+
+    def test_cache_exists_on_class(self):
+        """VLLMBackend must expose a class-level _decode_token_cache dict-like object."""
+        from constrained_translation.vllm_backend import VLLMBackend
+        assert hasattr(VLLMBackend, "_decode_token_cache")
+        cache = VLLMBackend._decode_token_cache
+        # Must support len() and clear()
+        assert hasattr(cache, "__len__")
+        assert hasattr(cache, "clear")
+
+    def test_same_instance_hit_avoids_second_post(self):
+        """Second call for same token_id on same instance must NOT make an HTTP request."""
+        from constrained_translation.vllm_backend import BackendError
+        b = _make_backend()
+        resp = _make_response(200, {"prompt": "hello"})
+        with patch("requests.post", return_value=resp) as mock_post:
+            r1 = b.decode_token(42)
+            r2 = b.decode_token(42)
+        # HTTP POST called exactly once
+        assert mock_post.call_count == 1
+        assert r1 == "hello"
+        assert r2 == "hello"
+
+    def test_same_instance_different_tokens_both_posted(self):
+        """Different token_ids must each make their own HTTP request."""
+        b = _make_backend()
+        with patch("requests.post", side_effect=[
+            _make_response(200, {"prompt": "hello"}),
+            _make_response(200, {"prompt": "world"}),
+        ]) as mock_post:
+            r1 = b.decode_token(1)
+            r2 = b.decode_token(2)
+        assert mock_post.call_count == 2
+        assert r1 == "hello"
+        assert r2 == "world"
+
+    def test_cross_instance_same_endpoint_model_hit(self):
+        """A second instance with the same base_url+model must hit the cache."""
+        resp = _make_response(200, {"prompt": "cached_result"})
+        with patch("requests.post", return_value=resp) as mock_post:
+            b1 = _make_backend(base_url="http://localhost:8000", model="m")
+            b2 = _make_backend(base_url="http://localhost:8000", model="m")
+            r1 = b1.decode_token(99)
+            r2 = b2.decode_token(99)
+        assert mock_post.call_count == 1
+        assert r1 == "cached_result"
+        assert r2 == "cached_result"
+
+    def test_cross_instance_different_endpoint_separate_cache(self):
+        """Different base_urls must NOT share cached entries."""
+        with patch("requests.post", side_effect=[
+            _make_response(200, {"prompt": "from_a"}),
+            _make_response(200, {"prompt": "from_b"}),
+        ]) as mock_post:
+            b1 = _make_backend(base_url="http://server-a:8000", model="m")
+            b2 = _make_backend(base_url="http://server-b:8000", model="m")
+            r1 = b1.decode_token(5)
+            r2 = b2.decode_token(5)
+        assert mock_post.call_count == 2
+        assert r1 == "from_a"
+        assert r2 == "from_b"
+
+    def test_cross_instance_different_model_separate_cache(self):
+        """Different model names on the same base_url must NOT share cached entries."""
+        with patch("requests.post", side_effect=[
+            _make_response(200, {"prompt": "from_model_a"}),
+            _make_response(200, {"prompt": "from_model_b"}),
+        ]) as mock_post:
+            b1 = _make_backend(base_url="http://localhost:8000", model="model-A")
+            b2 = _make_backend(base_url="http://localhost:8000", model="model-B")
+            r1 = b1.decode_token(7)
+            r2 = b2.decode_token(7)
+        assert mock_post.call_count == 2
+        assert r1 == "from_model_a"
+        assert r2 == "from_model_b"
+
+    def test_failure_not_cached(self):
+        """A failed decode_token (BackendError) must NOT be stored in the cache.
+
+        A subsequent call for the same token_id must retry the HTTP request.
+        """
+        from constrained_translation.vllm_backend import BackendError
+        b = _make_backend()
+        with patch("requests.post", side_effect=[
+            _make_response(500, {"error": "server error"}),   # first call — fails
+            _make_response(200, {"prompt": "recovered"}),     # second call — succeeds
+        ]) as mock_post:
+            with pytest.raises(BackendError):
+                b.decode_token(10)
+            result = b.decode_token(10)
+        assert mock_post.call_count == 2
+        assert result == "recovered"
+
+    def test_failure_http_not_cached_on_error_response(self):
+        """HTTP 4xx errors must not be cached; retry must hit network."""
+        from constrained_translation.vllm_backend import BackendError
+        b = _make_backend()
+        with patch("requests.post", side_effect=[
+            _make_response(404, {"error": "not found"}),
+            _make_response(200, {"prompt": "ok"}),
+        ]) as mock_post:
+            with pytest.raises(BackendError):
+                b.decode_token(20)
+            result = b.decode_token(20)
+        assert mock_post.call_count == 2
+        assert result == "ok"
+
+    def test_cache_size_bounded_at_8192(self):
+        """Cache must not exceed 8192 entries (eviction must occur)."""
+        from constrained_translation.vllm_backend import VLLMBackend
+        b = _make_backend()
+
+        def _resp_for(tid):
+            return _make_response(200, {"prompt": f"tok_{tid}"})
+
+        # Fill 8193 distinct token IDs
+        with patch("requests.post", side_effect=[_resp_for(i) for i in range(8193)]):
+            for i in range(8193):
+                b.decode_token(i)
+
+        assert len(VLLMBackend._decode_token_cache) <= 8192
+
+    def test_decode_tokens_sequence_always_posts(self):
+        """decode_tokens (full sequence) must NOT use the single-token cache."""
+        b = _make_backend()
+        resp = _make_response(200, {"prompt": "hello world"})
+        with patch("requests.post", return_value=resp) as mock_post:
+            r1 = b.decode_tokens([1, 2])
+            r2 = b.decode_tokens([1, 2])
+        # Both calls must go to the network — no caching for full sequences
+        assert mock_post.call_count == 2
+        assert r1 == "hello world"
+        assert r2 == "hello world"
+
+    def test_trailing_slash_normalisation_hits_cache(self):
+        """base_url with trailing slash must normalise to same key as without."""
+        resp = _make_response(200, {"prompt": "normalised"})
+        with patch("requests.post", return_value=resp) as mock_post:
+            from constrained_translation.vllm_backend import VLLMBackend
+            b1 = VLLMBackend(base_url="http://localhost:8000/", model="m")
+            b2 = VLLMBackend(base_url="http://localhost:8000", model="m")
+            r1 = b1.decode_token(3)
+            r2 = b2.decode_token(3)
+        assert mock_post.call_count == 1
+        assert r1 == "normalised"
+        assert r2 == "normalised"
+
+    def test_connection_error_not_cached(self):
+        """A connection-level error must not be cached; retry must hit network."""
+        from constrained_translation.vllm_backend import BackendError
+        b = _make_backend()
+        with patch("requests.post", side_effect=[
+            requests.ConnectionError("refused"),
+            _make_response(200, {"prompt": "retry_ok"}),
+        ]) as mock_post:
+            with pytest.raises(BackendError):
+                b.decode_token(30)
+            result = b.decode_token(30)
+        assert mock_post.call_count == 2
+        assert result == "retry_ok"
