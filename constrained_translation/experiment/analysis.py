@@ -300,8 +300,8 @@ def analyze_language(
         sc_raw = sc.get("raw_generation_text", None)
         so_naive_raw = _naive_raw_chrf(so_raw, ref)
         sc_naive_raw = _naive_raw_chrf(sc_raw, ref)
-        so_ftes = _formatting_tolerant_edit_similarity(so_trans or "", ref)
-        sc_ftes = _formatting_tolerant_edit_similarity(sc_trans or "", ref)
+        so_ftes = _formatting_tolerant_edit_similarity(so_raw or "", ref)
+        sc_ftes = _formatting_tolerant_edit_similarity(sc_raw or "", ref)
 
         item_scores.append(ItemScore(
             item_id=iid,

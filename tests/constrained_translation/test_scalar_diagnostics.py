@@ -619,6 +619,37 @@ class TestAnalysisWithRawFields:
             assert "sem_only_formatting_tolerant_edit_similarity" in item
             assert "sem_cov_formatting_tolerant_edit_similarity" in item
 
+    def test_formatting_tolerant_similarity_uses_raw_output_after_audit_failure(
+        self, raw_analysis_dirs
+    ):
+        """Rejected output is still the hypothesis for this non-gating metric."""
+        from constrained_translation.experiment.analysis import analyze_language
+
+        d = raw_analysis_dirs
+        results_path = d["sc_dir"] / "results.jsonl"
+        records = [json.loads(line) for line in results_path.read_text().splitlines()]
+        records[0]["translation"] = "[AUDIT_FAILURE]"
+        records[0]["hard_failure"] = True
+        records[0]["raw_generation_text"] = d["refs"][0]
+        results_path.write_text(
+            "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+        )
+
+        result = analyze_language(
+            lang="tst",
+            manifest_path=d["manifest_path"],
+            sem_only_dir=d["so_dir"],
+            sem_cov_dir=d["sc_dir"],
+            n_boot=50,
+            n_sign_flip=50,
+            seed=42,
+        )
+
+        assert result.items[0][
+            "sem_cov_formatting_tolerant_edit_similarity"
+        ] == pytest.approx(1.0)
+        assert result.items[0]["sem_cov_score"] == 0.0
+
     def test_lang_analysis_has_diagnostic_means(self, raw_analysis_dirs):
         """LangAnalysis must have mean diagnostic fields."""
         from constrained_translation.experiment.analysis import analyze_language
