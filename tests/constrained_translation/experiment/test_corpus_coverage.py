@@ -582,8 +582,8 @@ class TestMarginalGain:
 
     weighted_gain: sum of freq_index[t] for t in candidate's normalized types
                    that are NOT yet in known_types AND are in freq_index.
-    new_type_count: count of types from candidate not in known_types
-                    (regardless of whether in freq_index).
+    new_type_count: count of candidate types not in known_types and present
+                    in the fixed project frequency index.
     """
 
     def _ps_3(self):
