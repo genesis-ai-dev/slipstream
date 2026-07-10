@@ -61,7 +61,8 @@ You are a translator. Translate the source sentence into the target language.
 Only use vocabulary attested in the examples. \
 Uncovered spans are already marked as [UNK:span] — \
 these are deterministic input placeholders inserted before model generation, \
-not tokens you should generate yourself.
+not tokens you should generate yourself. \
+Output exactly one concise translation and stop.
 
 Examples:
 {examples}

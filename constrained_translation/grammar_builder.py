@@ -1,22 +1,37 @@
 """constrained_translation.grammar_builder — Per-request XGrammar EBNF grammar.
 
 Builds a grammar string that licenses *only* attested NFKC target surface units
-plus an explicit minimal punctuation set and whitespace/newline.
+plus an explicit minimal punctuation set and a canonical single-space separator.
 
 ## Grammar design
 
 The produced grammar is valid EBNF as consumed by XGrammar.  Its structure
-mirrors the plan (§7.6):
+prevents unattested lexical concatenation (e.g. ``terreAu`` from adjacent
+tokens ``terre`` + ``Au``) by requiring an explicit space separator between
+every pair of lexical units:
 
-    root         ::= translation
-    translation  ::= segment+
-    segment      ::= attested_token | punctuation | WS
+    root           ::= translation
+    translation    ::= (" ")* lex_core (" ")* "\\n"?
+    lex_core       ::= tok_unit (" " tok_unit)*
+    tok_unit       ::= PUNCT* attested_token PUNCT*
+    PUNCT          ::= "." | "," | "!" | "?" | ";" | ":" | "'" | "\\""
     attested_token ::= "word1" | "word2" | ...
-    punctuation  ::= "." | "," | "!" | "?" | ";" | ":" | "'" | "\""
-    WS           ::= (" " | "\\n")+
 
-Key invariants enforced here
------------------------------
+Key structural invariants
+--------------------------
+* Two attested surface units can **never** appear adjacent without an
+  intervening ``" "`` — the separator is mandatory in ``lex_core``.
+* At least one ``attested_token`` is always required (``lex_core`` →
+  ``tok_unit`` → ``attested_token``).  Whitespace/punctuation-only output
+  is structurally impossible.
+* Canonical single space as inter-token separator; optional leading/trailing
+  spaces and a single optional final newline.  No unbounded arbitrary
+  whitespace sequences between tokens.
+* Punctuation may be freely attached before and after any lexical unit
+  (``PUNCT*`` on both sides of ``attested_token``).
+
+Key invariants inherited from §7.6
+-------------------------------------
 * I2 — grammar is over surface tokens, not subword IDs.
 * I3 — ``[UNK:…]`` markers are **never** included; they are inserted
   deterministically by ``UNKDetector`` after generation.
@@ -28,9 +43,9 @@ Key invariants enforced here
 EBNF string literals are enclosed in double-quotes.  The following characters
 are escaped inside those literals:
 
-* ``"``  → ``\\"``
-* ``\\`` → ``\\\\``
-* ``\\n`` → ``\\\\n`` (to insert a literal backslash-n, not a newline)
+* ``"``  → ``\\"``   — closes the surrounding double-quote literal.
+* ``\\`` → ``\\\\``   — backslash must be doubled first to avoid
+  double-processing.
 
 All other characters — including Unicode letters, digits, apostrophes,
 brackets, and parentheses — are passed through verbatim.  XGrammar treats
@@ -111,7 +126,10 @@ class GrammarBuilder:
     The grammar licenses *only*:
     - Attested NFKC target surface tokens supplied in ``attested_vocab``.
     - A fixed minimal punctuation set: . , ! ? ; : ' "
-    - Whitespace (spaces) and a sentence-final newline.
+      (attached directly to tokens with no required separator).
+    - Optional leading/trailing spaces and a single optional final newline.
+    - Exactly one canonical single space as the mandatory separator between
+      adjacent lexical units (prevents unattested concatenation).
 
     [UNK:…] markers are NEVER licensed — they are inserted deterministically
     by ``UNKDetector`` outside model generation (invariant I3).
@@ -126,6 +144,16 @@ class GrammarBuilder:
         item_id: str,
     ) -> str:
         """Build and return the EBNF grammar string.
+
+        The grammar enforces:
+        - At least one attested lexical unit (empty / whitespace-only outputs
+          are rejected structurally).
+        - A mandatory single-space separator between adjacent lexical units
+          (prevents unattested concatenations such as ``terreAu``).
+        - Optional leading/trailing whitespace (one or more spaces) and a
+          single optional trailing newline.
+        - Punctuation may appear freely attached to either side of any
+          attested token — no separator required between punctuation and token.
 
         Args:
             attested_vocab: NFKC-normalised surface tokens from the target
@@ -190,13 +218,26 @@ class GrammarBuilder:
         ]
 
         # Assemble grammar rules.
+        #
+        # Structural design to prevent concatenation without separator:
+        #
+        #   translation  ::= (" ")* lex_core (" ")* "\n"?
+        #   lex_core     ::= tok_unit (" " tok_unit)*
+        #   tok_unit     ::= PUNCT* attested_token PUNCT*
+        #
+        # This means:
+        # - Between any two attested_token runs exactly one " " is required.
+        # - Leading/trailing spaces are optional.
+        # - A single final "\n" is optional.
+        # - Punctuation may be attached freely on either side of a token.
+        # - At least one attested_token is required (lex_core is not optional).
         lines: list[str] = [
-            "root         ::= translation",
-            "translation  ::= segment+",
-            "segment      ::= attested_token | punctuation | WS",
-            "attested_token ::= " + " | ".join(token_alts),
-            "punctuation  ::= " + " | ".join(punct_alts),
-            r'WS           ::= (" " | "\n")+',
+            'root           ::= translation',
+            'translation    ::= (" ")* lex_core (" ")* "\\n"?',
+            'lex_core       ::= tok_unit (" " tok_unit)*',
+            'tok_unit       ::= PUNCT* attested_token PUNCT*',
+            'PUNCT          ::= ' + ' | '.join(punct_alts),
+            'attested_token ::= ' + ' | '.join(token_alts),
         ]
 
         return "\n".join(lines) + "\n"

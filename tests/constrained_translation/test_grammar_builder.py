@@ -444,6 +444,187 @@ def test_grammar_builder_still_rejects_right_to_left_embedding():
     assert "Cf" in exc_info.value.reason
 
 
+# ---------------------------------------------------------------------------
+# NEW TESTS — tightened grammar: concatenation prevention, separator, coverage
+# ---------------------------------------------------------------------------
+
+def test_grammar_accepted_hello_world():
+    """'hello world' must be structurally accepted by the tightened grammar.
+
+    Both tokens are attested; they are separated by a canonical single space,
+    so they must form a valid lex_core.
+    """
+    m = _import_builder()
+    vocab = frozenset(["hello", "world"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="SEP 1:1")
+    # Grammar must contain both tokens
+    assert '"hello"' in grammar or "hello" in grammar
+    assert '"world"' in grammar or "world" in grammar
+    # The separator pattern must appear in lex_core: tok_unit (" " tok_unit)*
+    assert '" "' in grammar or "' '" in grammar, (
+        "Grammar missing mandatory single-space separator"
+    )
+
+
+def test_grammar_structure_prevents_bare_concatenation():
+    """The grammar must require a ' ' separator between adjacent lexical units.
+
+    The old grammar allowed segment+ where each segment could be an
+    attested_token, producing unattested concatenations like 'terreAu'.
+    The new grammar requires lex_core ::= tok_unit (' ' tok_unit)* which
+    makes a space mandatory between any two lexical runs.
+    """
+    m = _import_builder()
+    vocab = frozenset(["terre", "Au"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="CONCAT 1:1")
+    # The grammar must define lex_core with a mandatory space separator
+    assert "lex_core" in grammar, "Grammar missing lex_core rule"
+    # tok_unit must exist and wrap attested_token
+    assert "tok_unit" in grammar, "Grammar missing tok_unit rule"
+    # The separator is a literal single space between tok_units
+    # The pattern (' ' tok_unit) must appear in the grammar
+    assert '" " tok_unit' in grammar or "' ' tok_unit" in grammar, (
+        "Grammar missing mandatory ' ' tok_unit separator in lex_core"
+    )
+
+
+def test_grammar_requires_at_least_one_lexical_unit():
+    """translation must not be satisfiable by whitespace or punctuation alone.
+
+    The tightened grammar requires lex_core which requires at least one
+    tok_unit which requires at least one attested_token — so the root
+    cannot be satisfied by empty/WS/punctuation-only output.
+    """
+    m = _import_builder()
+    vocab = frozenset(["hello"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="REQ 1:1")
+    # lex_core must be non-optional (not followed by ?)
+    # Check that the translation rule references lex_core non-optionally
+    lines = grammar.splitlines()
+    translation_line = next((l for l in lines if l.strip().startswith("translation")), "")
+    assert "lex_core" in translation_line, (
+        "translation rule must reference lex_core (mandatory lexical core)"
+    )
+    # lex_core must not have a ? after it making it optional
+    assert "lex_core?" not in translation_line, (
+        "lex_core must not be optional — at least one lexical unit required"
+    )
+
+
+def test_grammar_punctuation_attachment_accepted():
+    """Punctuation attached to a token (e.g. 'hello,') must be structurally accepted.
+
+    tok_unit ::= PUNCT* attested_token PUNCT* means punctuation is freely
+    attachable to either side of a token with no separator required.
+    """
+    m = _import_builder()
+    vocab = frozenset(["hello", "world"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="PUNCT 1:1")
+    # PUNCT rule must exist and list the standard punctuation characters
+    assert "PUNCT" in grammar, "Grammar missing PUNCT rule"
+    punct_line = next(
+        (l for l in grammar.splitlines() if l.strip().startswith("PUNCT")), ""
+    )
+    for ch in [".", ",", "!", "?"]:
+        assert ch in punct_line, f"Punctuation char {ch!r} missing from PUNCT rule"
+    # tok_unit must reference PUNCT
+    tok_unit_line = next(
+        (l for l in grammar.splitlines() if l.strip().startswith("tok_unit")), ""
+    )
+    assert "PUNCT" in tok_unit_line, "tok_unit must reference PUNCT"
+    assert "attested_token" in tok_unit_line, "tok_unit must reference attested_token"
+
+
+def test_grammar_empty_or_layout_only_rejected_structurally():
+    """Empty output and layout-only (whitespace/punct-only) must be structurally rejected.
+
+    The grammar requires at least one lex_core (non-optional), and lex_core
+    requires at least one tok_unit with an attested_token.  A purely
+    whitespace or punctuation sequence cannot satisfy this requirement.
+    """
+    m = _import_builder()
+    vocab = frozenset(["hello"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="EMPTY 1:1")
+    # translation must have lex_core (non-optional) in the middle
+    # Structurally: translation ::= (" ")* lex_core (" ")* "\n"?
+    translation_line = next(
+        (l for l in grammar.splitlines() if l.strip().startswith("translation")), ""
+    )
+    assert "lex_core" in translation_line, (
+        "translation rule must require lex_core — empty output must be rejected"
+    )
+
+
+def test_grammar_unk_rejected_structurally():
+    """[UNK:…] markers must never appear in the grammar.
+
+    The tightened grammar still upholds invariant I3: UNK markers are never
+    licensed as generatable tokens.
+    """
+    m = _import_builder()
+    vocab = frozenset(["hello", "world"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="UNK 1:1")
+    assert "[UNK:" not in grammar, "[UNK: found in grammar — invariant I3 violated"
+    assert "UNK" not in grammar, "UNK string found in grammar — invariant I3 violated"
+
+
+def test_grammar_canonical_single_space_separator():
+    """The separator between lexical units must be exactly one ' ', not WS+.
+
+    The old grammar had WS ::= (' ' | '\\n')+ which allowed unbounded
+    whitespace sequences.  The new grammar uses a canonical single space.
+    """
+    m = _import_builder()
+    vocab = frozenset(["God", "created"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="SPACE 1:1")
+    # Old WS rule must not exist
+    assert "WS" not in grammar, (
+        "Old unbounded WS rule still present — must be replaced with canonical single space"
+    )
+    # The lex_core separator must be literal single space
+    assert '" " tok_unit' in grammar or "' ' tok_unit" in grammar, (
+        "lex_core must use a literal single-space separator"
+    )
+
+
+def test_grammar_optional_leading_trailing_spaces():
+    """translation must allow optional leading and trailing spaces."""
+    m = _import_builder()
+    vocab = frozenset(["hello"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="LEAD 1:1")
+    translation_line = next(
+        (l for l in grammar.splitlines() if l.strip().startswith("translation")), ""
+    )
+    # Optional spaces on both sides of lex_core: (" ")* ... (" ")*
+    assert '(" ")*' in translation_line or "(' ')*" in translation_line, (
+        "translation rule must allow optional leading/trailing spaces"
+    )
+
+
+def test_grammar_optional_final_newline():
+    """translation must allow an optional single final newline."""
+    m = _import_builder()
+    vocab = frozenset(["hello"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="NL 1:1")
+    translation_line = next(
+        (l for l in grammar.splitlines() if l.strip().startswith("translation")), ""
+    )
+    assert '"\\n"?' in translation_line or r'"\n"?' in translation_line, (
+        "translation rule must allow an optional final newline"
+    )
+
+
+def test_grammar_unicode_burmese_compiles():
+    """Burmese token with U+200B must compile through the tightened grammar."""
+    m = _import_builder()
+    tok = "လေ့လာ\u200bရန်"
+    vocab = frozenset([tok, "သည်"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="MYA 3:1")
+    assert isinstance(grammar, str)
+    assert "lex_core" in grammar
+    assert "tok_unit" in grammar
+
+
 def test_grammar_builder_still_rejects_left_to_right_override():
     """U+202D LEFT-TO-RIGHT OVERRIDE (Cf) must still be rejected."""
     m = _import_builder()

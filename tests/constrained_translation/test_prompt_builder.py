@@ -514,3 +514,48 @@ def test_deterministic_output():
     result_a = m.PromptBuilder().build(req)
     result_b = m.PromptBuilder().build(req)
     assert result_a == result_b, "PromptBuilder is not deterministic"
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS — "output exactly one concise translation and stop" instruction
+# ---------------------------------------------------------------------------
+
+def test_prompt_instructs_single_translation():
+    """The prompt must instruct the model to output exactly one translation.
+
+    This reduces max-token repetition by making the termination condition
+    explicit in the prompt itself.
+    """
+    m = _import_builder()
+    req = _make_request()
+    result = m.PromptBuilder().build(req)
+    lower = result.lower()
+    # Must contain some form of "exactly one" or "one ... translation" instruction
+    assert (
+        "exactly one" in lower
+        or ("one" in lower and "translation" in lower and "stop" in lower)
+    ), (
+        "Prompt must instruct the model to output exactly one translation and stop:\n"
+        + result
+    )
+
+
+def test_prompt_instructs_stop_after_translation():
+    """The prompt must tell the model to stop after producing the translation."""
+    m = _import_builder()
+    req = _make_request()
+    result = m.PromptBuilder().build(req)
+    lower = result.lower()
+    assert "stop" in lower or "do not continue" in lower or "do not add" in lower, (
+        "Prompt must tell the model to stop after one translation:\n" + result
+    )
+
+
+def test_prompt_template_has_single_translation_instruction():
+    """PROMPT_TEMPLATE must include the single-translation stop instruction."""
+    m = _import_builder()
+    template = m.PROMPT_TEMPLATE
+    lower = template.lower()
+    assert "exactly one" in lower or "stop" in lower, (
+        "PROMPT_TEMPLATE must contain 'exactly one' or 'stop' instruction"
+    )
