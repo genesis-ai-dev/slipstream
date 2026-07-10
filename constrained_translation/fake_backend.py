@@ -106,6 +106,23 @@ class FakeBackend:
                 f"(has never been assigned by this FakeBackend instance)"
             ) from None
 
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        """Return the full surface string for a sequence of *token_ids*.
+
+        For the FakeBackend's whitespace-split tokeniser, the correct
+        full-sequence detokenisation is simply joining the individual
+        decoded tokens with a space — this mirrors what a whitespace
+        tokeniser would do and avoids the BPE partial-word problem at the
+        FakeBackend level.
+
+        An empty sequence returns an empty string.
+
+        Raises ValueError if any token_id has never been assigned.
+        """
+        if not token_ids:
+            return ""
+        return " ".join(self.decode_token(tid) for tid in token_ids)
+
     def generate(
         self,
         prompt: str,

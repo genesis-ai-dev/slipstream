@@ -166,6 +166,21 @@ class BackendProtocol(Protocol):
         """Return the surface string for a single token ID."""
         ...
 
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        """Return the surface string for a full sequence of token IDs.
+
+        This performs full-sequence detokenisation, which is required for
+        BPE tokenisers (e.g. Qwen3.5) and byte-level tokenisers where
+        decoding individual tokens in isolation produces incorrect or
+        garbled output (e.g. U+FFFD byte fragments for multi-byte Unicode
+        characters).
+
+        The result should match what the tokeniser's detokenise() / decode()
+        method returns for the complete sequence — not a simple concatenation
+        of individual decode_token() results.
+        """
+        ...
+
     def is_available(self) -> bool:
         """Return True if the backend is reachable / ready."""
         ...

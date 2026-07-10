@@ -240,6 +240,7 @@ class TestSuccessfulPath:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         # Response must only contain tokens from target vocab
         response_words = ["Dieu", "créa", "les", "cieux"]
@@ -486,6 +487,7 @@ class TestGrammarBuildFailure:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         with patch(
             "constrained_translation.batch_runner.GrammarBuilder"
@@ -518,6 +520,7 @@ class TestGrammarBuildFailure:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         with patch(
             "constrained_translation.batch_runner.GrammarBuilder"
@@ -550,6 +553,7 @@ class TestGrammarBuildFailure:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         with patch(
             "constrained_translation.batch_runner.GrammarBuilder"
@@ -590,6 +594,7 @@ class TestTokenAuditFailure:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         # Generate a response whose tokens won't be in the license
         bad_response = "totally unlicensed output"
@@ -635,6 +640,7 @@ class TestTokenAuditFailure:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         bad_response = "FORBIDDEN OUTPUT DO NOT USE"
         mock_backend.generate.return_value = GenerationResult(
@@ -678,6 +684,7 @@ class TestTokenAuditFailure:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         mock_backend.generate.return_value = GenerationResult(
             text="bad output",
@@ -728,6 +735,7 @@ class TestNoBackendCallWithoutGrammar:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         response = "Dieu créa les cieux"
         mock_backend.generate.return_value = GenerationResult(
@@ -849,6 +857,7 @@ class TestProvenanceLogging:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         # Return a response made only of attested target words
         response = "Dieu créa les cieux"
@@ -896,6 +905,7 @@ class TestProvenanceLogging:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
 
         response = "Dieu créa"
         mock_backend.generate.return_value = GenerationResult(
@@ -1051,6 +1061,7 @@ class TestBackendGenerationFailure:
             fb.tokenize(line)
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
         mock_backend.generate.side_effect = exc
         return mock_backend
 
@@ -1134,6 +1145,7 @@ class TestBackendGenerationFailure:
         mock_backend.is_available.return_value = True
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
         mock_backend.generate.side_effect = generate_side_effect
 
         runner = BatchRunner(
@@ -1221,6 +1233,7 @@ class TestExplicitTerminalEvents:
         mock_backend.is_available.return_value = True
         mock_backend.tokenize.side_effect = fb.tokenize
         mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.decode_tokens.side_effect = fb.decode_tokens
         response = "Dieu créa les cieux"
         mock_backend.generate.return_value = GenerationResult(
             text=response,

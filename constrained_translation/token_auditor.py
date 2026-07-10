@@ -12,9 +12,26 @@ enforces two complementary invariants:
    string (the *token licence*).
 
 2. **Surface-composition check** — even if every subword piece ID is licenced,
-   adjacent pieces are *reconstructed* into full surface words and each
-   resulting word must appear in ``attested_vocab``.  This prevents the model
-   from recombining licenced subword pieces into novel, unattested words.
+   the licensed tokens are *reconstructed* into full surface text using the
+   backend's ``decode_tokens()`` (full-sequence detokenisation), and each
+   resulting surface word must appear in ``attested_vocab``.  This prevents
+   the model from recombining licenced subword pieces into novel, unattested
+   words.
+
+   ``decode_tokens()`` is used (rather than concatenating individual
+   ``decode_token()`` results) because BPE tokenisers such as Qwen3.5 and
+   byte-level tokenisers can produce garbled output when tokens are decoded
+   individually:
+
+   * **BPE partial-word splits** — "créa" may tokenise as [cré_id, a_id].
+     ``decode_token(cré_id)`` → "cré"; ``decode_token(a_id)`` → "a".
+     Neither "cré" nor "a" is in ``attested_vocab``, causing a false
+     violation.  ``decode_tokens([cré_id, a_id])`` → "créa" (correct).
+
+   * **Byte-level BPE fragments** — a single Burmese Unicode character
+     (UTF-8: 3 bytes) may split into three byte tokens, each decoding to
+     U+FFFD in isolation.  ``decode_tokens`` of the full sequence returns
+     the actual character.
 
 3. **UNK-marker rejection** — tokens whose decoded surface matches the pattern
    ``[UNK:…]`` always fail, regardless of licence status (invariant I3: UNK
@@ -107,69 +124,70 @@ def _nfkc(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
 
 
-def _strip_word_boundary(piece: str) -> str:
-    """Remove a leading SentencePiece word-boundary marker (▁)."""
-    if piece.startswith(_WORD_BOUNDARY):
-        return piece[1:]
-    return piece
+def _is_punct_or_symbol(ch: str) -> bool:
+    """Return True iff *ch* is a Unicode punctuation or symbol character.
 
-
-def _has_word_boundary(piece: str) -> bool:
-    """Return True if *piece* starts with the SentencePiece boundary marker."""
-    return piece.startswith(_WORD_BOUNDARY)
-
-
-def _reconstruct_surface_words(decoded_pieces: list[str]) -> list[str]:
-    """Reconstruct full surface words from subword pieces.
-
-    Algorithm
-    ---------
-    A piece that *starts* with the SentencePiece boundary marker (▁) begins a
-    new word.  A piece without the marker is a *continuation* of the current
-    word.  The marker itself is stripped from the output.
-
-    If no marker convention is detected (e.g. a simple whitespace-split
-    tokenizer), every piece is treated as its own word.
-
-    Returns
-    -------
-    list[str]
-        Each entry is a reconstructed surface word (NFKC-normalised, stripped
-        of the ▁ marker).  Empty words are omitted.
+    Combining marks (category Mn, Mc, Me) return False — they must remain
+    attached to their base glyph.
     """
-    if not decoded_pieces:
+    cat = unicodedata.category(ch)
+    return cat.startswith("P") or cat.startswith("S")
+
+
+def _split_punctuation(token: str) -> list[str]:
+    """Split leading/trailing punctuation from a whitespace token.
+
+    Mirrors VocabExtractor._split_punctuation semantics so that surface words
+    extracted from decode_tokens() output are comparable with attested_vocab
+    produced by VocabExtractor.
+    """
+    if not token:
         return []
 
-    # Detect whether SentencePiece convention is in use for *this batch*.
-    uses_boundary_marker = any(_has_word_boundary(p) for p in decoded_pieces)
+    lead_end = 0
+    while lead_end < len(token) and _is_punct_or_symbol(token[lead_end]):
+        lead_end += 1
 
-    if not uses_boundary_marker:
-        # Simple tokenizer: treat each non-empty, non-layout piece as its own word.
-        words = []
-        for piece in decoded_pieces:
-            w = _nfkc(piece).strip()
-            if w:
-                words.append(w)
-        return words
+    trail_start = len(token)
+    while trail_start > lead_end and _is_punct_or_symbol(token[trail_start - 1]):
+        trail_start -= 1
 
-    # SentencePiece reconstruction.
+    lead = token[:lead_end]
+    body = token[lead_end:trail_start]
+    trail = token[trail_start:]
+
+    parts: list[str] = []
+    if lead:
+        parts.append(lead)
+    if body:
+        parts.append(body)
+    if trail:
+        parts.append(trail)
+    return parts if parts else [token]
+
+
+def _surface_words_from_text(text: str) -> list[str]:
+    """Split a detokenised text into surface words using VocabExtractor semantics.
+
+    Algorithm (mirrors VocabExtractor.extract):
+      1. NFKC-normalise the full text.
+      2. Split on Unicode whitespace.
+      3. Separate leading/trailing punctuation/symbols from each token.
+      4. Return non-empty, non-layout sub-tokens.
+
+    This function is used for the surface-composition check in TokenAuditor.audit()
+    after full-sequence decode_tokens() to handle BPE and byte-level tokenisers
+    correctly.
+    """
+    nfkc_text = _nfkc(text)
     words: list[str] = []
-    current: list[str] = []
-
-    for piece in decoded_pieces:
-        if _has_word_boundary(piece):
-            # Flush the current word.
-            if current:
-                words.append(_nfkc("".join(current)))
-            current = [_strip_word_boundary(piece)]
-        else:
-            # Continuation piece.
-            current.append(piece)
-
-    if current:
-        words.append(_nfkc("".join(current)))
-
-    return [w for w in words if w]
+    for raw_tok in nfkc_text.split():
+        if not raw_tok:
+            continue
+        for sub in _split_punctuation(raw_tok):
+            if sub and not _is_layout(sub):
+                words.append(sub)
+    return words
 
 
 # ---------------------------------------------------------------------------
@@ -328,21 +346,48 @@ class TokenAuditor:
                         seen_provenance[tid].append(v)
 
         # ── Step 3: Surface-composition check ───────────────────────────────
-        # Reconstruct full surface words from the (ordered) sequence of decoded
-        # pieces for IDs that are licensed (unlicensed IDs already recorded a
-        # violation at Step 2c; we must not double-count them as surface failures).
-        # Also cache decode_token calls — already done via decoded_map above.
-        licensed_token_ids = [tid for tid in token_ids if tid in full_licence]
-        all_decoded_pieces = [decoded_map[tid] for tid in licensed_token_ids]
-        surface_words = _reconstruct_surface_words(all_decoded_pieces)
+        # Use backend.decode_tokens() (full-sequence detokenisation) for the
+        # licensed token IDs.  This is required for BPE tokenisers (Qwen3.5)
+        # and byte-level tokenisers where individual decode_token() calls
+        # produce partial/garbled output.
+        # Detokenise the complete sequence. Filtering out unlicensed or layout
+        # IDs before this step would corrupt whitespace and byte-level Unicode
+        # reconstruction; those IDs are already handled by Step 2.
+        # Reconstruct the complete generated sequence, including layout and any
+        # unlicensed IDs. Removing IDs before detokenisation can erase spaces or
+        # byte fragments and falsely merge adjacent attested words. ID-level
+        # violations are still reported independently above.
+        # Surface recombination is only meaningful when every lexical ID has a
+        # provenance licence. If any lexical ID is unlicensed, Step 2 already
+        # makes the audit fail loudly; skip Step 3 to avoid duplicate/misattributed
+        # surface violations while still allowing unlicensed layout IDs.
+        has_unlicensed_lexical_id = any(
+            tid not in full_licence and not _is_layout(decoded_map[tid])
+            for tid in token_ids
+        )
+        if token_ids and not has_unlicensed_lexical_id:
+            decode_tokens = getattr(backend, "decode_tokens", None)
+            if callable(decode_tokens):
+                # Required path for real BPE/byte-level backends.
+                full_surface_text = decode_tokens(token_ids)
+            else:
+                # Compatibility path for narrow test doubles and legacy custom
+                # backends. SentencePiece markers preserve subword boundaries;
+                # otherwise conservatively treat each decoded piece as a word.
+                pieces = [decoded_map[tid] for tid in token_ids]
+                if any(_WORD_BOUNDARY in piece for piece in pieces):
+                    full_surface_text = "".join(pieces).replace(_WORD_BOUNDARY, " ")
+                else:
+                    full_surface_text = " ".join(pieces)
+            surface_words = _surface_words_from_text(full_surface_text)
+        else:
+            surface_words = []
 
         for word in surface_words:
+            # _surface_words_from_text already applies NFKC and filters layout;
+            # apply NFKC again defensively for the attested_vocab lookup.
             nfkc_word = _nfkc(word)
             if not nfkc_word:
-                continue
-            # Skip pure-layout words (shouldn't occur after reconstruction but
-            # guard defensively).
-            if _is_layout(nfkc_word):
                 continue
             if nfkc_word not in attested_vocab:
                 violations.append(

@@ -303,6 +303,52 @@ class VLLMBackend:
 
         return data["prompt"]
 
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        """Decode a full sequence of *token_ids* to a surface string.
+
+        Unlike ``decode_token`` (single-ID), this method sends the **entire**
+        token list to the vLLM ``/detokenize`` endpoint in one request.  This
+        is the correct approach for BPE tokenisers (e.g. Qwen3.5) and
+        byte-level tokenisers where decoding tokens individually produces
+        garbled output (e.g. U+FFFD byte fragments for multi-byte Unicode
+        characters).
+
+        Parameters
+        ----------
+        token_ids:
+            List of integer token IDs to detokenise.
+
+        Returns
+        -------
+        str
+            The full detokenised string (as returned by the tokeniser's
+            decode method).  Empty list returns empty string without any
+            HTTP request.
+
+        Raises
+        ------
+        BackendError
+            On HTTP error, malformed response, or missing ``prompt`` key.
+        """
+        if not token_ids:
+            return ""
+
+        payload = {
+            "model": self.model,
+            "tokens": token_ids,
+        }
+
+        data = self._post("/detokenize", payload, "decode_tokens")
+
+        if "prompt" not in data:
+            raise BackendError(
+                "decode_tokens",
+                None,
+                f"Response missing 'prompt' key: {data!r}",
+            )
+
+        return data["prompt"]
+
     def is_available(self) -> bool:
         """Return True if the vLLM server is healthy and ready.
 
