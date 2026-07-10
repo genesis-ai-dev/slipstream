@@ -4,7 +4,7 @@
 
 **Goal:** Measure how arbitrary, silver, and golden source-only acquisition ordering changes whole-project coverage and fixed-eval constrained translation per human-translated cell.
 
-**Architecture:** Add a deterministic sequencing layer above the existing constrained translation pipeline. Evaluate source coverage for every eligible remaining-project cell each round, but call vLLM only for supported cells; persist immutable manifests and append-only per-cell/per-round records, then render a graph bundle after each language-policy-seed permutation.
+**Architecture:** Add a deterministic sequencing layer above the existing constrained translation pipeline. Evaluate a fixed 200-line eligible project slice each round, but call vLLM only for supported cells; persist immutable manifests and append-only per-cell/per-round records, then render a graph bundle after each language-policy-seed permutation. Compose the allow-list grammar with an optional per-segment GBS overlay for triggered human glossary terms.
 
 **Tech Stack:** Python 3.11, pytest, existing BM25/coverage retrieval, vLLM 0.19, XGrammar 0.1.33, Qwen3.5-9B, matplotlib, JSONL/JSON/CSV.
 
@@ -15,6 +15,7 @@
 - Shared source indices and normalized-source equivalence groups are used across `mya`, `npi`, `ckb`, and `tpi`.
 - Pools are equivalence-disjoint by normalized key: seed, acquisition, and fixed_eval each hold **exactly one representative** (lowest corpus index) per equivalence group; no normalized key crosses among these three named pools.  Non-representative rows of named-pool groups remain in `remaining` as operational project cells, and `remaining` is **never** a few-shot pool or fixed-eval source.
 - `len(seed) == seed_size`, `len(acquisition) == acq_size`, `len(fixed_eval) == eval_size` — exact, not "at least".
+- The operational project view is the first 200 eligible rows of `remaining` in canonical corpus order, frozen in run configuration and shared across languages and policies. Golden optimizes against this same 200-line project slice.
 - Round 0 is seed-only. Round `r` for 1–40 is measured after acquisition `r` is added.
 - Selection is source-only. Target references are revealed only after a candidate has been selected.
 - Silver maximizes current source support fraction, then BM25 similarity to the translated pool, then stable corpus index.
@@ -24,6 +25,8 @@
 - Source abstention artifact: detector marks a unit unknown although the canonical unit is present in the translated source pool. This is a normalization/index defect.
 - Constraint artifact: a source-supported generation is rejected despite its visible lexical surface being licensed, due only to tokenization, byte decoding, terminal control, grammar, or normalization handling.
 - Emitted hallucination: visible or token-ID lexical output is unlicensed. Escaped hallucination: such output is accepted or serialized as translation; this must be zero.
+- A triggered human glossary term is licensed evidence for that segment. Its target surface units and token IDs are unioned into the request license with glossary provenance before grammar compilation. GBS is activated only for triggered entries; grammar-only behavior is unchanged otherwise.
+- Grammar-plus-GBS reachability is a pre-flight gate. An unreachable forced phrase fails loudly without unconstrained fallback or silent term dropping.
 - `licensed_failure_zero_chrf` uses all source-supported eval cells as denominator and gives rejected generations zero. Accepted-only chrF is diagnostic. Abstentions are excluded from licensed-region quality but retained in project-completion effectiveness.
 - Golden accounting calibration compares ex-ante weighted gain with deterministic ex-post source-coverage reduction. Generalization evidence is the non-circular fixed-eval accepted/quality change.
 
@@ -75,6 +78,15 @@ Never overwrite or resume across a changed manifest, code revision, normalizatio
 - Test: `tests/constrained_translation/experiment/test_outcomes.py`
 
 **Steps:** Test safe source abstention, false source abstention, accepted licensed generation, constraint artifact, emitted hallucination, and escaped-hallucination invariant with distinct sentinel fields. Verify RED, implement without weakening grammar/audits, verify GREEN/full suite, commit.
+
+### Task 4b: Compose grammar licensing with triggered terminology
+
+**Files:**
+- Create: `constrained_translation/terminology_constraints.py`
+- Modify only if required: `constrained_translation/protocol.py`, backend protocol implementations
+- Test: `tests/constrained_translation/test_terminology_constraints.py`
+
+**Steps:** Test source-trigger scoping, glossary provenance, union of forced target surfaces and token IDs into the request license before grammar compilation, whitespace/punctuation reachability, unreachable-phrase loud failure, multiple active terms, and exact grammar-only identity when no trigger is active. Add a backend capability pre-flight: if active GBS cannot compose with XGrammar, abort rather than dropping either constraint; an inactive glossary must require no GBS support. Verify RED/GREEN/full suite and commit.
 
 ### Task 5: Implement the round runner and durable records
 

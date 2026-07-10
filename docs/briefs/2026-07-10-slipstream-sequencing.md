@@ -38,9 +38,22 @@ Success does not require high chrF. Success requires:
 - Serving: vLLM + XGrammar constrained decoding. Per-request grammar compiled from the licensed token set. Not OpenAI-style static logit_bias.
 - Per language, three disjoint pools:
   - Acquisition set: 40 sentences, representing the project the human will translate over time.
-  - Remaining project: the rest of the corpus, predicted each round (project-completion view).
+  - Remaining project: a fixed 200-line project slice, predicted each round (project-completion view). Use the first 200 eligible remaining-project rows in canonical corpus order after seed/acquisition/fixed-eval exclusions and leakage filtering. The same source indices are used for every language and policy.
   - Fixed external eval set: held out, identical across all policies and rounds (generalization view). Never enters any few-shot pool.
 - Seed: the same small translated seed pool for every policy so round 0 is identical.
+
+### 3.1 Constraint layers: grammar plus triggered terminology
+
+Every prediction uses the evidence-derived allow-list grammar. A second, optional Grid Beam Search (GBS) layer activates only when the source segment contains a trigger for a human-supplied terminology entry.
+
+- Scope GBS per prediction to the terms whose source triggers occur in that segment. Most segments therefore use plain grammar decoding; terminology-bearing segments pay only for their small active constraint grid.
+- Before decoding, union every active human-supplied target term into that segment's licensed target set. A glossary term is human-attested evidence and must retain glossary-entry provenance. Without this union, the grammar can mask the phrase GBS is required to emit, creating a deadlock.
+- Compile the structural grammar after the union. Whitespace and narrowly allowed punctuation/layout remain structurally reachable so a forced phrase cannot strand the beam.
+- Add a reachability pre-flight and regression test for every active forced phrase. If grammar plus GBS has no valid completion, fail loudly; never fall back to unconstrained decoding or silently drop the term.
+- GBS guarantees phrase inclusion, not lexical alignment. Because predictions are short single segments, the placement ambiguity is limited but remains a reported limitation.
+- When no terminology trigger is active, behavior must be identical to the grammar-only baseline.
+
+Terminology forcing is a compositional safety layer, not a sequencing policy and not an additional source of model training. If this experiment's selected corpora have no configured human glossary, the layer remains inactive and the sequencing comparison is grammar-only.
 
 ---
 
@@ -62,9 +75,11 @@ For each language, each policy, each round (0 → 40):
 1. Select the next acquisition sentence per policy; add its reference translation to the translated pool (simulates the human placing a bank).
 2. Retrieve few-shot examples from the pool (semantic + coverage-targeted, per prior method).
 3. Deterministically compute unsupported source spans before generation and mark them [UNK:source].
-4. Build the XGrammar grammar from the licensed token set (union of target tokens in retrieved examples).
-5. Predict (a) every remaining project segment and (b) the fixed external eval set under constraint.
-6. Record all metrics in §6.
+4. Resolve human glossary entries whose source triggers occur in the segment; union their forced target terms into the licensed set with provenance.
+5. Build the XGrammar grammar from the combined licensed set and verify every active forced phrase is reachable.
+6. Decode under the grammar, adding the per-prediction GBS overlay only when active terminology exists.
+7. Predict (a) every segment in the fixed 200-line project slice and (b) the fixed external eval set under constraint.
+8. Record all metrics in §6.
 
 ---
 
@@ -136,6 +151,7 @@ Generate and share after each permutation completes (do not wait for the full mu
 
 ## 10. Explicitly out of scope
 - Fine-tuning or adding tokens to the model (in-context only — this is what keeps it working for languages with only a handful of pairs).
-- Any output not traceable to attested few-shot evidence, even if it "looks" plausible.
+- Any output not traceable to licensed human evidence—retrieved translated examples or an active triggered glossary entry—even if it "looks" plausible.
+- Treating a glossary term as unlicensed: a triggered human glossary entry is attested evidence for that segment and must be recorded as such.
 - Optimizing throughput by loosening the constraint. Throughput is secondary; the constraint is the product.
 - Claiming a source unknown maps to a specific target word — without alignment we have co-occurrence, not lexical alignment. All unknown/coverage claims are source-side.
