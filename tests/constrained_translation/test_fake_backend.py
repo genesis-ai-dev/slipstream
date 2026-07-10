@@ -148,7 +148,8 @@ class TestTokenAuditResult:
     def test_fields(self):
         from constrained_translation.protocol import TokenAuditResult
         field_names = {f.name for f in dataclasses.fields(TokenAuditResult)}
-        assert field_names == {"passed", "violations"}
+        # Core required fields (additional scalar diagnostic fields are allowed)
+        assert {"passed", "violations"}.issubset(field_names)
 
 
 class TestTranslationResult:

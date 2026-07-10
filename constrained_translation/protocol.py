@@ -91,10 +91,23 @@ class GenerationResult:
 
 @dataclass
 class TokenAuditResult:
-    """Post-decode token-ID audit result (invariant I2)."""
+    """Post-decode token-ID audit result (invariant I2).
+
+    Scalar diagnostic fields
+    ------------------------
+    token_provenance_ratio : float, [0, 1]
+        licensed / generated non-layout token occurrences.  Non-gating — does
+        not affect ``passed``.
+    surface_attestation_similarity : float, [0, 1]
+        Full-sequence decoded lexical words scored against nearest
+        ``attested_vocab`` token by 1-normalised Levenshtein, weighted by
+        word character length.  Empty lexical output → 0.0.  Non-gating.
+    """
 
     passed: bool
     violations: list[str]    # list of "token_id=N decoded='x' not in attested_vocab"
+    token_provenance_ratio: float = 0.0
+    surface_attestation_similarity: float = 0.0
 
 
 # ---------------------------------------------------------------------------

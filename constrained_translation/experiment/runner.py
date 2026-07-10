@@ -247,6 +247,17 @@ def run_condition(
     # Write results JSONL
     with results_path.open("w", encoding="utf-8") as fh:
         for r in results:
+            # Raw generation fields (null if no generation occurred)
+            gen = r.generation_result
+            audit = r.token_audit
+            raw_generation_text: object = gen.text if gen is not None else None
+            raw_token_ids: object = gen.token_ids if gen is not None else None
+            token_provenance_ratio: object = (
+                audit.token_provenance_ratio if audit is not None else None
+            )
+            surface_attestation_similarity: object = (
+                audit.surface_attestation_similarity if audit is not None else None
+            )
             rec = {
                 "item_id": r.item_id,
                 "source_text": r.source_text,
@@ -255,6 +266,10 @@ def run_condition(
                 "retry_count": r.retry_count,
                 "hard_failure": r.hard_failure,
                 "error": r.error,
+                "raw_generation_text": raw_generation_text,
+                "raw_token_ids": raw_token_ids,
+                "token_provenance_ratio": token_provenance_ratio,
+                "surface_attestation_similarity": surface_attestation_similarity,
             }
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 

@@ -191,6 +191,117 @@ def _surface_words_from_text(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Scalar diagnostic helpers (non-gating)
+# ---------------------------------------------------------------------------
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Compute Levenshtein edit distance between two strings."""
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    la, lb = len(a), len(b)
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            if a[i - 1] == b[j - 1]:
+                curr[j] = prev[j - 1]
+            else:
+                curr[j] = 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev = curr
+    return prev[lb]
+
+
+def _compute_token_provenance_ratio(
+    token_ids: list[int],
+    decoded_map: dict[int, str],
+    full_licence: "TokenLicense",
+) -> float:
+    """Compute licensed / non-layout token occurrence ratio.
+
+    Numerator: occurrences of non-layout token IDs that are in the licence.
+    Denominator: total non-layout token occurrences.
+    Returns 0.0 if denominator is 0.
+    """
+    n_total = 0
+    n_licensed = 0
+    for tid in token_ids:
+        decoded = decoded_map.get(tid, "")
+        if _is_layout(decoded) or _is_unk_marker(decoded):
+            continue
+        n_total += 1
+        if tid in full_licence:
+            n_licensed += 1
+    if n_total == 0:
+        return 0.0
+    return n_licensed / n_total
+
+
+def _compute_surface_attestation_similarity(
+    token_ids: list[int],
+    decoded_map: dict[int, str],
+    attested_vocab: frozenset[str],
+    backend: "BackendProtocol",
+) -> float:
+    """Compute surface attestation similarity (non-gating).
+
+    Algorithm
+    ---------
+    1. Decode the full sequence via ``decode_tokens`` (or fallback) to
+       recover properly reconstructed text.
+    2. Extract lexical words using VocabExtractor semantics
+       (NFKC + whitespace split + punctuation separation).
+    3. For each lexical word, compute 1-normalised Levenshtein against every
+       token in ``attested_vocab`` and take the best (maximum) similarity.
+    4. Return the character-length-weighted average of per-word similarities.
+       Empty lexical output → 0.0.  Empty attested_vocab → 0.0.
+    """
+    if not token_ids or not attested_vocab:
+        return 0.0
+
+    # Full-sequence decode (same logic as Step 3 in audit())
+    decode_tokens_fn = getattr(backend, "decode_tokens", None)
+    if callable(decode_tokens_fn):
+        full_text = decode_tokens_fn(token_ids)
+    else:
+        pieces = [decoded_map.get(tid, "") for tid in token_ids]
+        if any(_WORD_BOUNDARY in p for p in pieces):
+            full_text = "".join(pieces).replace(_WORD_BOUNDARY, " ")
+        else:
+            full_text = " ".join(pieces)
+
+    words = _surface_words_from_text(full_text)
+    if not words:
+        return 0.0
+
+    attested_list = list(attested_vocab)
+    total_weight = 0.0
+    weighted_sim = 0.0
+    for word in words:
+        word_len = len(word)
+        if word_len == 0:
+            continue
+        # Best similarity to any attested token
+        best_sim = 0.0
+        for av in attested_list:
+            max_len = max(len(word), len(av))
+            if max_len == 0:
+                sim = 1.0
+            else:
+                sim = 1.0 - _levenshtein(word, av) / max_len
+            if sim > best_sim:
+                best_sim = sim
+        weighted_sim += best_sim * word_len
+        total_weight += word_len
+
+    if total_weight == 0.0:
+        return 0.0
+    return weighted_sim / total_weight
+
+
+# ---------------------------------------------------------------------------
 # Public class
 # ---------------------------------------------------------------------------
 
@@ -395,5 +506,18 @@ class TokenAuditor:
                     f"(subword recombination produced an unattested word)"
                 )
 
+        # ── Step 4: Scalar diagnostics (non-gating) ─────────────────────────
+        token_provenance_ratio = _compute_token_provenance_ratio(
+            token_ids, decoded_map, full_licence
+        )
+        surface_attestation_similarity = _compute_surface_attestation_similarity(
+            token_ids, decoded_map, attested_vocab, backend
+        )
+
         passed = len(violations) == 0
-        return TokenAuditResult(passed=passed, violations=violations), seen_provenance
+        return TokenAuditResult(
+            passed=passed,
+            violations=violations,
+            token_provenance_ratio=token_provenance_ratio,
+            surface_attestation_similarity=surface_attestation_similarity,
+        ), seen_provenance

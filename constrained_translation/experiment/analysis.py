@@ -30,13 +30,79 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import asdict, dataclass
+import unicodedata
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
 from metrics.chrf import chrF_plus
+
+
+# ---------------------------------------------------------------------------
+# Non-gating diagnostic helpers
+# ---------------------------------------------------------------------------
+
+def _levenshtein(a: str, b: str) -> int:
+    """Levenshtein edit distance."""
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    la, lb = len(a), len(b)
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            if a[i - 1] == b[j - 1]:
+                curr[j] = prev[j - 1]
+            else:
+                curr[j] = 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev = curr
+    return prev[lb]
+
+
+def _normalize_for_edit(text: str) -> str:
+    """NFKC, remove Cf / P* / S* characters, collapse whitespace."""
+    text = unicodedata.normalize("NFKC", text)
+    buf = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if cat.startswith("C"):
+            # Keep only printable non-Cf; Cf = Format chars
+            if cat == "Cf":
+                continue
+            # Other C categories (Cc, Cs, Co, Cn): skip
+            continue
+        if cat.startswith("P") or cat.startswith("S"):
+            continue
+        buf.append(ch)
+    collapsed = " ".join("".join(buf).split())
+    return collapsed
+
+
+def _formatting_tolerant_edit_similarity(hypothesis: str, reference: str) -> float:
+    """1-normalised character edit distance after aggressive normalization.
+
+    Returns 0.0 if either side normalizes to empty.
+    """
+    h = _normalize_for_edit(hypothesis)
+    r = _normalize_for_edit(reference)
+    if not h or not r:
+        return 0.0
+    max_len = max(len(h), len(r))
+    return 1.0 - _levenshtein(h, r) / max_len
+
+
+def _naive_raw_chrf(raw_generation_text: Optional[str], reference: str) -> float:
+    """chrF+ of raw generation text vs reference, regardless of audit outcome.
+
+    Returns 0.0 when raw_generation_text is None or empty.
+    """
+    if not raw_generation_text or not reference:
+        return 0.0
+    return chrF_plus(hypothesis=raw_generation_text, reference=reference)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +207,11 @@ class ItemScore:
     reference: str
     sem_only_translation: str
     sem_cov_translation: str
+    # Non-gating diagnostics
+    sem_only_naive_raw_chrf: float = 0.0
+    sem_cov_naive_raw_chrf: float = 0.0
+    sem_only_formatting_tolerant_edit_similarity: float = 0.0
+    sem_cov_formatting_tolerant_edit_similarity: float = 0.0
 
 
 @dataclass
@@ -167,6 +238,13 @@ class LangAnalysis:
     sem_cov_token_audit_pass_pct: float = 0.0
     sem_only_mean_tok_per_sec: float = 0.0
     sem_cov_mean_tok_per_sec: float = 0.0
+    # NON-GATING DIAGNOSTIC means
+    sem_only_mean_naive_raw_chrf: float = 0.0
+    sem_cov_mean_naive_raw_chrf: float = 0.0
+    mean_diff_naive_raw_chrf: float = 0.0
+    sem_only_mean_formatting_tolerant_edit_similarity: float = 0.0
+    sem_cov_mean_formatting_tolerant_edit_similarity: float = 0.0
+    mean_diff_formatting_tolerant_edit_similarity: float = 0.0
 
 
 def analyze_language(
@@ -216,6 +294,15 @@ def analyze_language(
         # ``translation`` (for example source text containing [UNK:…] spans).
         so_score = 0.0 if so.get("hard_failure", True) else _score_item(so_trans, ref)
         sc_score = 0.0 if sc.get("hard_failure", True) else _score_item(sc_trans, ref)
+
+        # Non-gating diagnostics
+        so_raw = so.get("raw_generation_text", None)
+        sc_raw = sc.get("raw_generation_text", None)
+        so_naive_raw = _naive_raw_chrf(so_raw, ref)
+        sc_naive_raw = _naive_raw_chrf(sc_raw, ref)
+        so_ftes = _formatting_tolerant_edit_similarity(so_trans or "", ref)
+        sc_ftes = _formatting_tolerant_edit_similarity(sc_trans or "", ref)
+
         item_scores.append(ItemScore(
             item_id=iid,
             sem_only_score=so_score,
@@ -224,6 +311,10 @@ def analyze_language(
             reference=ref,
             sem_only_translation=so_trans,
             sem_cov_translation=sc_trans,
+            sem_only_naive_raw_chrf=so_naive_raw,
+            sem_cov_naive_raw_chrf=sc_naive_raw,
+            sem_only_formatting_tolerant_edit_similarity=so_ftes,
+            sem_cov_formatting_tolerant_edit_similarity=sc_ftes,
         ))
 
     diffs = [s.diff for s in item_scores]
@@ -233,6 +324,12 @@ def analyze_language(
     mean_diff = float(np.mean(diffs))
     ci_lo, ci_hi = _bootstrap_mean_diff_ci(diffs, n_boot=n_boot, alpha=0.05, seed=seed)
     p_val = _sign_flip_p_value(diffs, n_iter=n_sign_flip, seed=seed)
+
+    # Non-gating diagnostic means
+    so_raw_chrfs = [s.sem_only_naive_raw_chrf for s in item_scores]
+    sc_raw_chrfs = [s.sem_cov_naive_raw_chrf for s in item_scores]
+    so_ftes_vals = [s.sem_only_formatting_tolerant_edit_similarity for s in item_scores]
+    sc_ftes_vals = [s.sem_cov_formatting_tolerant_edit_similarity for s in item_scores]
 
     return LangAnalysis(
         lang=lang,
@@ -254,6 +351,14 @@ def analyze_language(
         sem_cov_token_audit_pass_pct=sem_cov_rollup.get("token_audit_pass_pct", 0.0),
         sem_only_mean_tok_per_sec=sem_only_rollup.get("mean_tok_per_sec", 0.0),
         sem_cov_mean_tok_per_sec=sem_cov_rollup.get("mean_tok_per_sec", 0.0),
+        sem_only_mean_naive_raw_chrf=float(np.mean(so_raw_chrfs)),
+        sem_cov_mean_naive_raw_chrf=float(np.mean(sc_raw_chrfs)),
+        mean_diff_naive_raw_chrf=float(np.mean(sc_raw_chrfs)) - float(np.mean(so_raw_chrfs)),
+        sem_only_mean_formatting_tolerant_edit_similarity=float(np.mean(so_ftes_vals)),
+        sem_cov_mean_formatting_tolerant_edit_similarity=float(np.mean(sc_ftes_vals)),
+        mean_diff_formatting_tolerant_edit_similarity=(
+            float(np.mean(sc_ftes_vals)) - float(np.mean(so_ftes_vals))
+        ),
     )
 
 
@@ -364,6 +469,18 @@ def render_markdown(
             f", sem+cov={_fmt(a.sem_cov_token_audit_pass_pct, 1)}",
             f"- Mean generated tokens/sec: sem-only={_fmt(a.sem_only_mean_tok_per_sec, 1)}"
             f", sem+cov={_fmt(a.sem_cov_mean_tok_per_sec, 1)}",
+            "",
+            "**NON-GATING DIAGNOSTIC metrics** (do not affect acceptance)",
+            "",
+            f"- Naive raw chrF+ (sem-only): {_fmt(a.sem_only_mean_naive_raw_chrf)}",
+            f"- Naive raw chrF+ (sem+cov):  {_fmt(a.sem_cov_mean_naive_raw_chrf)}",
+            f"- Naive raw chrF+ paired diff: {_fmt(a.mean_diff_naive_raw_chrf)}",
+            f"- Formatting-tolerant edit similarity (sem-only):"
+            f" {_fmt(a.sem_only_mean_formatting_tolerant_edit_similarity)}",
+            f"- Formatting-tolerant edit similarity (sem+cov):"
+            f"  {_fmt(a.sem_cov_mean_formatting_tolerant_edit_similarity)}",
+            f"- Formatting-tolerant edit similarity paired diff:"
+            f" {_fmt(a.mean_diff_formatting_tolerant_edit_similarity)}",
             "",
         ]
 
