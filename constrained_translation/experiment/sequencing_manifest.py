@@ -56,7 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from constrained_translation.experiment.manifest import _passes_filters
@@ -268,6 +268,11 @@ def build_sequencing_manifest(
 
     # Alignment check: exact equality of row counts required
     n_rows = len(eng_lines)
+    if len(vrefs) != n_rows:
+        raise ValueError(
+            f"Verse-reference file has {len(vrefs)} rows but English corpus has "
+            f"{n_rows} rows — length mismatch detected."
+        )
     for lang in languages:
         if len(lang_lines[lang]) != n_rows:
             raise ValueError(
@@ -277,7 +282,7 @@ def build_sequencing_manifest(
 
     # Build eligible row set: pass _passes_filters(real_src, real_tgt) for ALL languages
     eligible_indices: list[int] = []
-    for i in range(min(n_rows, len(vrefs))):
+    for i in range(n_rows):
         src = eng_lines[i]
         all_pass = True
         for lang in languages:

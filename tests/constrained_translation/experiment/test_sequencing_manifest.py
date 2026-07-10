@@ -1093,3 +1093,20 @@ class TestExactCorpusAlignment:
                 eval_size=7,
                 random_seed=42,
             )
+
+    def test_shorter_vref_file_raises_value_error(self, small_corpora, tmp_path):
+        """A short reference file must fail instead of truncating project rows."""
+        short_vrefs = tmp_path / "short-vref.txt"
+        short_vrefs.write_text("GEN 1:1\nGEN 1:2\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="vref|reference|length|rows|align|mismatch"):
+            build_sequencing_manifest(
+                eng_corpus_path=small_corpora["eng_path"],
+                lang_corpus_paths=small_corpora["lang_paths"],
+                vref_path=short_vrefs,
+                languages=LANGUAGES,
+                seed_size=3,
+                acq_size=5,
+                eval_size=7,
+                random_seed=42,
+            )
