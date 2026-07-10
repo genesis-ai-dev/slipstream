@@ -1,7 +1,7 @@
 """constrained_translation.cli — Command-line interface for constrained translation.
 
-Usage
------
+Usage — offline (FakeBackend)
+------------------------------
 python -m constrained_translation.cli \\
     --source  corpus/source.txt \\
     --target  corpus/target.txt \\
@@ -9,6 +9,24 @@ python -m constrained_translation.cli \\
     --output  results.jsonl \\
     --log     events.jsonl \\
     --fake-backend
+
+Usage — real vLLM backend
+--------------------------
+python -m constrained_translation.cli \\
+    --source  corpus/source.txt \\
+    --target  corpus/target.txt \\
+    --input   items.jsonl \\
+    --output  results.jsonl \\
+    --log     events.jsonl \\
+    --vllm-url http://localhost:8000 \\
+    --model   Qwen/Qwen2.5-7B-Instruct
+
+Backend selection flags (mutually exclusive):
+  --fake-backend          Use FakeBackend (no GPU, offline, for testing)
+  --vllm-url URL          Use VLLMBackend pointing at this URL
+
+  --model MODEL           Required when --vllm-url is given; the model name
+                          as registered in vLLM.
 
 Input JSONL format (one JSON object per line):
 
@@ -26,12 +44,6 @@ Output JSONL format (one JSON object per line per input item):
 
 Stdout:
     A single JSON object with aggregate batch rollup statistics.
-
-Extensibility
--------------
-Real backend wiring is deferred to Task 14.  The ``--fake-backend`` flag
-activates ``FakeBackend``; additional ``--backend-*`` flags should be added
-here when the real backend is implemented.
 """
 
 from __future__ import annotations
@@ -161,14 +173,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to write event log JSONL (coverage, audit, provenance events).",
     )
 
-    # Backend selection (extensible for Task 14)
+    # Backend selection (mutually exclusive: --fake-backend or --vllm-url)
     backend_group = p.add_mutually_exclusive_group()
     backend_group.add_argument(
         "--fake-backend", action="store_true", default=False,
         help="Use FakeBackend for offline testing (no GPU or model download required).",
     )
-    # Placeholder for future real backend flags (Task 14)
-    # backend_group.add_argument("--vllm-backend", action="store_true", ...)
+    backend_group.add_argument(
+        "--vllm-url", metavar="URL", default=None,
+        help=(
+            "Use VLLMBackend pointing at this URL "
+            "(e.g. http://localhost:8000).  Requires --model."
+        ),
+    )
+
+    # --model is required when --vllm-url is given; accepted but ignored for --fake-backend
+    p.add_argument(
+        "--model", metavar="MODEL", default=None,
+        help=(
+            "Model name as registered in vLLM "
+            "(required when --vllm-url is given; "
+            "e.g. Qwen/Qwen2.5-7B-Instruct)."
+        ),
+    )
 
     # Runner hyperparameters
     p.add_argument(
@@ -214,12 +241,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     # -- Select backend -------------------------------------------------------
     if args.fake_backend:
         backend = FakeBackend()
+    elif args.vllm_url:
+        # Validate that --model was also supplied
+        if not args.model:
+            sys.stderr.write(
+                "Error: --vllm-url requires --model to be specified.\n"
+                "Example: --vllm-url http://localhost:8000 --model Qwen/Qwen2.5-7B-Instruct\n"
+            )
+            return 1
+        from constrained_translation.vllm_backend import VLLMBackend
+        backend = VLLMBackend(base_url=args.vllm_url, model=args.model)
     else:
-        # Default to FakeBackend until Task 14 wires the real backend
-        # Future: instantiate VLLMBackend here based on --vllm-* flags
+        # Default to FakeBackend when no backend flag is given
         sys.stderr.write(
             "Warning: no backend selected; defaulting to --fake-backend.\n"
-            "Pass --fake-backend explicitly or implement Task 14.\n"
+            "Pass --fake-backend explicitly, or use --vllm-url URL --model MODEL.\n"
         )
         backend = FakeBackend()
 

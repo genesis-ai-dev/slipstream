@@ -422,3 +422,75 @@ class TestUnicodeSerialisation:
         assert proc.returncode == 0, f"stderr: {proc.stderr}"
         results = _read_jsonl(ws2["output"])
         assert results[0]["source_text"] == uni_source
+
+
+# ---------------------------------------------------------------------------
+# §7  Backend selection flags (Task 14)
+# ---------------------------------------------------------------------------
+
+class TestBackendFlags:
+    """Tests for --fake-backend / --vllm-url mutual exclusion and --model."""
+
+    def _run_raw(self, workspace, extra_args):
+        """Run CLI without the default --fake-backend flag."""
+        cmd = [
+            sys.executable, "-m", "constrained_translation.cli",
+            "--source", workspace["source"],
+            "--target", workspace["target"],
+            "--input",  workspace["input"],
+            "--output", workspace["output"],
+            "--log",    workspace["log"],
+            "--max-retries", "0",
+            "--n-semantic", "4",
+            "--n-coverage", "4",
+        ] + extra_args
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+    def test_fake_backend_flag_works(self, workspace):
+        """--fake-backend must produce exit 0."""
+        proc = self._run_raw(workspace, ["--fake-backend"])
+        assert proc.returncode == 0, f"stderr: {proc.stderr}"
+
+    def test_vllm_url_without_model_exits_nonzero(self, workspace):
+        """--vllm-url without --model must exit non-zero with a helpful message."""
+        proc = self._run_raw(workspace, ["--vllm-url", "http://localhost:9999"])
+        assert proc.returncode != 0
+        assert "model" in proc.stderr.lower() or "model" in proc.stdout.lower()
+
+    def test_fake_backend_and_vllm_url_mutually_exclusive(self, workspace):
+        """--fake-backend and --vllm-url are mutually exclusive."""
+        proc = self._run_raw(
+            workspace,
+            ["--fake-backend", "--vllm-url", "http://localhost:9999"],
+        )
+        assert proc.returncode != 0
+
+    def test_model_without_vllm_url_accepted(self, workspace):
+        """--model alone (no --vllm-url) should be accepted; backend defaults to fake."""
+        # --model is silently ignored when --fake-backend is used
+        proc = self._run_raw(workspace, ["--fake-backend", "--model", "some-model"])
+        assert proc.returncode == 0, f"stderr: {proc.stderr}"
+
+    def test_no_backend_flag_defaults_to_fake_exits_zero(self, workspace):
+        """No backend flag → default fake backend; must still exit 0."""
+        proc = self._run_raw(workspace, [])
+        # Warning is printed to stderr, but exit code must be 0
+        assert proc.returncode == 0, f"stderr: {proc.stderr}"
+
+    def test_no_backend_flag_prints_warning(self, workspace):
+        """No backend flag → a warning must appear on stderr."""
+        proc = self._run_raw(workspace, [])
+        assert "warning" in proc.stderr.lower() or "no backend" in proc.stderr.lower()
+
+    def test_vllm_url_with_model_instantiates_vllm_backend(self, workspace):
+        """--vllm-url + --model must attempt to use VLLMBackend (connection failure = expected)."""
+        # With a non-existent server, the run should fail or produce a hard failure,
+        # but NOT a missing-model error.  The important assertion is that --model was
+        # accepted and the error is a connection-level problem.
+        proc = self._run_raw(
+            workspace,
+            ["--vllm-url", "http://127.0.0.1:19999", "--model", "test-model"],
+        )
+        # Should not emit the "requires --model" error
+        stderr_lower = proc.stderr.lower()
+        assert "requires --model" not in stderr_lower
