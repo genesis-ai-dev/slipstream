@@ -24,9 +24,23 @@ python -m constrained_translation.cli \\
 Backend selection flags (mutually exclusive):
   --fake-backend          Use FakeBackend (no GPU, offline, for testing)
   --vllm-url URL          Use VLLMBackend pointing at this URL
+  --model-url URL         Alias for --vllm-url
 
   --model MODEL           Required when --vllm-url is given; the model name
                           as registered in vLLM.
+  --model-name MODEL      Alias for --model.
+
+Argument aliases:
+  --source-file PATH      Alias for --source
+  --target-file PATH      Alias for --target
+  --model-url URL         Alias for --vllm-url
+  --model-name MODEL      Alias for --model
+
+Optional flags:
+  --rollup PATH           Write rollup JSON to file (in addition to stdout).
+  --batch-size N          Items per progress chunk (default: 50).
+                          Note: items are processed sequentially; this does
+                          NOT enable parallel backend calls.
 
 Input JSONL format (one JSON object per line):
 
@@ -153,12 +167,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Required I/O arguments
     p.add_argument(
-        "--source", required=True, metavar="PATH",
-        help="Path to the aligned source corpus file (one verse per line).",
+        "--source", "--source-file", required=True, metavar="PATH",
+        dest="source",
+        help="Path to the aligned source corpus file (one verse per line). Alias: --source-file.",
     )
     p.add_argument(
-        "--target", required=True, metavar="PATH",
-        help="Path to the aligned target corpus file (same order as --source).",
+        "--target", "--target-file", required=True, metavar="PATH",
+        dest="target",
+        help="Path to the aligned target corpus file (same order as --source). Alias: --target-file.",
     )
     p.add_argument(
         "--input", required=True, metavar="PATH",
@@ -172,35 +188,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--log", required=True, metavar="PATH",
         help="Path to write event log JSONL (coverage, audit, provenance events).",
     )
+    p.add_argument(
+        "--rollup", metavar="PATH", default=None,
+        help="Optional path to write rollup JSON file (default: only printed to stdout).",
+    )
 
-    # Backend selection (mutually exclusive: --fake-backend or --vllm-url)
+    # Backend selection (mutually exclusive: --fake-backend or --vllm-url / --model-url)
     backend_group = p.add_mutually_exclusive_group()
     backend_group.add_argument(
         "--fake-backend", action="store_true", default=False,
         help="Use FakeBackend for offline testing (no GPU or model download required).",
     )
     backend_group.add_argument(
-        "--vllm-url", metavar="URL", default=None,
+        "--vllm-url", "--model-url", metavar="URL", default=None,
+        dest="vllm_url",
         help=(
             "Use VLLMBackend pointing at this URL "
-            "(e.g. http://localhost:8000).  Requires --model."
+            "(e.g. http://localhost:8000).  Requires --model/--model-name. "
+            "Alias: --model-url."
         ),
     )
 
-    # --model is required when --vllm-url is given; accepted but ignored for --fake-backend
+    # --model / --model-name (required when --vllm-url is given)
     p.add_argument(
-        "--model", metavar="MODEL", default=None,
+        "--model", "--model-name", metavar="MODEL", default=None,
+        dest="model",
         help=(
             "Model name as registered in vLLM "
-            "(required when --vllm-url is given; "
-            "e.g. Qwen/Qwen2.5-7B-Instruct)."
+            "(required when --vllm-url/--model-url is given; "
+            "e.g. Qwen/Qwen2.5-7B-Instruct). Alias: --model-name."
         ),
     )
 
     # Runner hyperparameters
     p.add_argument(
-        "--max-retries", type=int, default=3, metavar="N",
-        help="Maximum coverage-expansion retries per item (default: 3).",
+        "--max-retries", type=int, default=2, metavar="N",
+        help="Maximum coverage-expansion retries per item (default: 2).",
     )
     p.add_argument(
         "--n-semantic", type=int, default=5, metavar="N",
@@ -217,6 +240,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--temperature", type=float, default=0.0, metavar="F",
         help="Sampling temperature (default: 0.0 = greedy).",
+    )
+    p.add_argument(
+        "--batch-size", type=int, default=50, metavar="N",
+        help=(
+            "Items per progress chunk (default: 50). "
+            "Note: items are processed sequentially; this does not enable "
+            "parallel backend calls."
+        ),
     )
 
     return p
@@ -307,6 +338,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     rollup_dict = _rollup_to_dict(rollup)
     sys.stdout.write(json.dumps(rollup_dict, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+    # -- Write rollup JSON to file (if --rollup was given) -------------------
+    if args.rollup:
+        rollup_path = Path(args.rollup)
+        try:
+            with rollup_path.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(rollup_dict, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            sys.stderr.write(f"Warning: could not write rollup file: {exc}\n")
 
     return 0
 

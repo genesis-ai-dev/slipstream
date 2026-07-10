@@ -2,7 +2,7 @@
 
 **Branch:** `feat/constrained-translation-loop`  
 **Model target:** Qwen3.5-9B served locally via vLLM with XGrammar structured generation  
-**Status:** Plan only — no production code yet  
+**Status:** Implementation complete — see implementation notes below
 **Date:** 2026-07-09
 
 ---
@@ -219,7 +219,7 @@ One JSON object per line in the output log file:
 ```json
 {
   "ts": "2026-07-09T16:00:00Z",
-  "event": "coverage_failure | retry | hard_failure | success | token_audit_violation",
+  "event": "coverage_failure | coverage_retry | hard_failure | success | token_audit_violation | provenance | batch_summary",
   "item_id": "GEN 1:1",
   "retry_count": 0,
   "coverage_pass": false,
@@ -234,6 +234,10 @@ One JSON object per line in the output log file:
   "error": null
 }
 ```
+
+**Terminal events:** exactly one of `{success, hard_failure}` per item.
+`provenance` is additional (not a terminal); it carries the token→verse map for accepted results.
+`token_audit_violation` is emitted before `hard_failure` when audit fails.
 
 ---
 
@@ -447,56 +451,55 @@ Now translate:
 ### 7.9 `BatchRunner` (`batch_runner.py`)
 
 **Inputs:**
-- `items: list[tuple[str, str]]` — `(item_id, source_text)` pairs
+- `items: list[BatchItem]` — each with `item_id`, `source_text`, `exclude_idx`
 - `backend: BackendProtocol`
-- `corpus_source_file: str`, `corpus_target_file: str`
-- `max_retries: int = 2`
-- `logger: JSONLLogger`
+- `source_file: str`, `target_file: str`
+- `max_retries: int = 2`  *(default updated from 3 to 2)*
+- `log_path: str`
 - `max_tokens: int = 256`
 - `n_semantic: int = 5`, `n_coverage: int = 5`
 
 **Output:** `tuple[list[TranslationResult], BatchRollup]`
 
-**Per-item loop:**
+**Per-item loop (implemented):**
 
-```
-for item_id, source_text in items:
-    attempt = 0
-    result = None
-    while attempt <= max_retries:
-        1. ExampleSelector.select(source_text, exclude_idx) → examples
-        2. VocabExtractor.extract(examples) → attested_vocab
-        3. UNKDetector.detect(source_text, attested_vocab) → unk_spans
-        4. try:
-               GrammarBuilder.build(attested_vocab, unk_spans) → grammar_str
-           except GrammarBuildError:
-               log hard_failure; break
-        5. PromptBuilder.build(request) → prompt
-        6. try:
-               backend.generate(prompt, grammar_str, max_tokens) → gen_result
-           except BackendError:
-               log retry; attempt += 1; continue
-        7. coverage_pass = all unk_spans were addressed or no unk_spans exist
-        8. TokenAuditor.audit(gen_result.token_ids, attested_vocab, backend, unk_spans) → audit
-        9. logger.log(event, ...)
-        10. if coverage_pass:
-                result = TranslationResult(coverage_pass=True, retry_count=attempt, ...)
-                break
-            elif attempt < max_retries:
-                logger.log("retry", ...)
-                attempt += 1
-            else:
-                result = TranslationResult(hard_failure=True, ...)
-                break
-    results.append(result)
+1. ExampleSelector.select(source_text, exclude_idx) → examples (source-side only)
+2. UNKDetector.detect(source_text, source_vocab_from_examples) → unk_spans
+   *Note: coverage check uses SOURCE strings of examples, NOT target attested_vocab (invariant I1/I2)*
+3. If coverage gaps remain → log `coverage_failure`, retry up to `max_retries` with
+   expanded `n_coverage`.  Retries are **coverage-only** — no unconstrained generation fallback.
+4. If coverage still fails after all retries → log `hard_failure(reason="coverage_failure")`,
+   return `[UNK:surface]` artifact.  `generate()` is **never** called.
+5. VocabExtractor.extract(examples) → attested_vocab (target-side only)
+6. GrammarBuilder.build(attested_vocab) → grammar_str.  `GrammarBuildError` → log
+   `hard_failure(reason="grammar_build_error")`, skip generate.
+7. PromptBuilder.build(request) → prompt
+8. `backend.generate(prompt, grammar_str, ...)` — grammar must be non-empty (invariant I5/I7).
+   **Any exception** (BackendError or other) → log `hard_failure(reason="backend_generation_failure")`,
+   return immediately, **no retry**, continue batch.
+9. TokenAuditor.audit(token_ids, attested_vocab, backend, examples) → audit_result.
+   - Audit fail → log `token_audit_violation` then `hard_failure(reason="token_audit_failure")`.
+     Translation is rejection artifact `[AUDIT_FAILURE]`, not model text.
+   - Audit pass → log `provenance` (token→verse map, additional) then `success` (terminal).
+10. After all items → compute BatchRollup, log `batch_summary`, return.
 
-rollup = RollupStats.compute(results)
-return results, rollup
-```
+**Terminal event invariant:** Exactly one of `{success, hard_failure}` per item.
+`provenance` is additional (not a terminal).
 
-**Coverage pass definition:** A result passes coverage iff:
-- The model output does not contain any raw source-language token that was listed in `unk_spans` outside of an `[UNK:…]` wrapper, AND
-- The model output contains `[UNK:surface]` for every span in `unk_spans`.
+**Coverage pass definition:** All source tokens covered by source-side example vocab before
+generation.  Model output never contains `[UNK:…]` markers — they are deterministic
+pre-generation artifacts only.
+
+**Backend failure is hard failure:** BackendError and any exception from `generate()` are
+treated as infrastructure failures, not coverage failures.  No retry on backend errors.
+
+**Modern vLLM 0.19 API:** Constrained generation uses
+`structured_outputs: {grammar: <grammar_str>}` in the HTTP body — *not* `guided_grammar`.
+This is verified working locally.
+
+**Coverage set-cover:** Custom greedy uncovered-unit set cover is intentional and superior
+to ContextQuery on the full query.  ContextQuery is used as the coverage-retrieval backend
+but the coverage check itself is the greedy source-vocab expansion.
 
 **Test target:** `tests/constrained_translation/test_batch_runner.py`
 
@@ -539,21 +542,30 @@ class RollupStats:
 
 ```
 usage: python -m constrained_translation.cli
-  --source-file PATH       Aligned source corpus (.txt, one sentence per line)
-  --target-file PATH       Aligned target corpus (.txt, one sentence per line)
-  --input PATH             Input file: one source sentence per line (or JSONL with "id","text")
+  --source PATH            Aligned source corpus (.txt, one sentence per line)
+  --source-file PATH       Alias for --source
+  --target PATH            Aligned target corpus (.txt, one sentence per line)
+  --target-file PATH       Alias for --target
+  --input PATH             Input JSONL (item_id, source_text, exclude_idx required)
   --output PATH            Output JSONL (one TranslationResult per line)
-  --log PATH               JSONL event log (default: output.log)
-  --rollup PATH            Rollup stats JSON (default: stdout)
-  --model-url URL          vLLM OpenAI-compat base URL (default: http://localhost:8000/v1)
-  --model-name STR         Model name for vLLM (default: Qwen/Qwen2.5-7B-Instruct)
+  --log PATH               JSONL event log
+  --rollup PATH            Optional rollup stats JSON file (also always printed to stdout)
+  --vllm-url URL           vLLM OpenAI-compat base URL (e.g. http://localhost:8000)
+  --model-url URL          Alias for --vllm-url
+  --model MODEL            Model name for vLLM (required with --vllm-url)
+  --model-name MODEL       Alias for --model
+  --fake-backend           Use FakeBackend with empty responses (for dry-run testing)
   --max-retries INT        (default: 2)
   --max-tokens INT         (default: 256)
   --n-semantic INT         Semantic example count (default: 5)
   --n-coverage INT         Coverage example count (default: 5)
-  --fake-backend           Use FakeBackend with empty responses (for dry-run testing)
-  --batch-size INT         Items per tqdm progress chunk (default: 50)
+  --batch-size INT         Items per progress chunk (default: 50; sequential, no parallelism)
 ```
+
+**Notes:**
+- `--batch-size` is accepted and documented but items are processed sequentially;
+  no backend parallelism is claimed or implemented.
+- `--rollup PATH` writes the same rollup JSON that is printed to stdout, to a file.
 
 **Test target:** `tests/constrained_translation/test_cli.py` — invokes via `subprocess.run` with `--fake-backend`.
 
@@ -805,11 +817,13 @@ Each task follows TDD: write the failing test first, then implement, then confir
 - `tests/constrained_translation/test_vllm_smoke.py` (skipped unless `VLLM_URL` env var is set)
 
 **VLLMBackend spec:**
-- Wraps OpenAI-compat client pointing at `model_url`.
-- `generate()` passes grammar via `extra_body={"guided_grammar": grammar_str}` (vLLM XGrammar API).
+- Wraps HTTP client (`requests`) pointing at `base_url`.
+- `generate()` passes grammar via `structured_outputs: {"grammar": grammar_str}` in the
+  request body — **vLLM 0.19 API**.  The old `guided_grammar` field is deprecated and
+  must NOT be used.
 - `tokenize()` calls `/tokenize` endpoint.
 - `decode_token()` calls `/detokenize` endpoint.
-- Raises `BackendError` (not `Exception`) on HTTP errors.
+- Raises `BackendError` (not bare `Exception`) on HTTP errors.
 - `is_available()` does a `/health` GET, returns bool.
 
 **Smoke test:**
@@ -889,7 +903,8 @@ The implementation is complete when all of the following hold:
    `BatchRollup.__dataclass_fields__` matches spec in §5.7.
 
 8. **CLI smoke-runs end-to-end:**  
-   `python -m constrained_translation.cli --fake-backend --source-file <tmp> --target-file <tmp> --input <tmp> --output /dev/null` exits 0 and prints valid JSON rollup.
+   `python -m constrained_translation.cli --fake-backend --source <tmp> --target <tmp> --input <tmp> --output /dev/null --log /dev/null` exits 0 and prints valid JSON rollup.
+   Aliases `--source-file`/`--target-file`, `--model-url`/`--model-name` also accepted.
 
 9. **vLLM smoke test passes (manual gate):**  
    With vLLM running locally: `VLLM_URL=http://localhost:8000 pytest tests/constrained_translation/test_vllm_smoke.py -m smoke` exits 0 with `hard_failure_pct < 1.0`.

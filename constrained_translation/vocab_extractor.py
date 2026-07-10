@@ -1,6 +1,7 @@
 """constrained_translation.vocab_extractor — Attested target-side vocabulary.
 
-Evidence tier: **Tier 1 (sentence co-occurrence)**.
+Evidence tier: **Tier 1 (sentence co-occurrence)**.  ``evidence_tier=1`` on
+every :class:`~constrained_translation.protocol.AlignedExample` records this.
 
 This module derives a frozenset of NFKC-normalised target-language surface
 lexical units exclusively from the *target* strings of a collection of
@@ -12,12 +13,12 @@ Given a set of selected aligned sentence pairs (source_i, target_i), the
 attested vocabulary is the set of whitespace-tokenised surface forms appearing
 in any target_i.
 
-**Critical disclaimer (invariant I1):** Sentence co-occurrence is NOT word
-alignment.  The fact that a surface form appears in a target sentence whose
-source counterpart resembles the query does NOT prove that the form translates
-any specific source word.  It merely means the form appears in translations of
-sentences related to the query, so we permit the model to use it as a
-plausibility filter.
+**Critical disclaimer (invariant I1):** Sentence co-occurrence is
+NOT word alignment.  The fact that a surface form appears in a target sentence
+whose source counterpart resembles the query does NOT prove that the form
+translates any specific source word.  It merely means the form appears in
+translations of sentences related to the query, so we permit the model to use
+it as a plausibility filter.
 
 No code or comment in this module may treat Tier-1 evidence as proof of
 word-to-word translation correspondence.
@@ -120,8 +121,9 @@ class VocabExtractor:
     def extract(self, examples: Iterable[AlignedExample]) -> frozenset[str]:
         """Return the union of NFKC-normalised surface tokens from all target strings.
 
-        Evidence tier: Tier 1 (sentence co-occurrence).  This is NOT word
-        alignment.  The returned tokens are surface forms that appear in target
+        Evidence tier: Tier 1 (sentence co-occurrence), recorded as
+        ``evidence_tier=1`` on each AlignedExample.  This is NOT word alignment.
+        The returned tokens are surface forms that appear in target
         translations of sentences related to the query; they do not constitute
         evidence that any individual token translates a specific source word.
 

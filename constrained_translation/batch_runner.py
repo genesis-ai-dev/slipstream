@@ -32,14 +32,17 @@ For each BatchItem the runner executes this pipeline:
    hard failure logged and returned; generate() is never called.
 
 6. **Generate** — call backend.generate(prompt, grammar, …).  Grammar must be
-   non-empty (invariant I7).
+   non-empty (invariant I7).  Any exception (BackendError or other) → log
+   ``hard_failure(reason="backend_generation_failure")``, return immediately,
+   NO retry, continue remaining items.
 
 7. **Token audit** — call TokenAuditor.audit().  If audit fails:
-   hard failure (translation = empty failure artifact, NOT the model text).
-   Log ``hard_failure`` with violations.
+   log ``token_audit_violation`` then ``hard_failure``
+   (translation = empty failure artifact, NOT the model text).
 
 8. **Accept** — result is accepted only when coverage_pass=True AND
-   token_audit.passed=True.  Log ``provenance`` with token→verse_idx map.
+   token_audit.passed=True.  Log ``provenance`` (additional) then ``success``
+   (terminal).
 
 9. **Batch summary** — after all items, compute BatchRollup via RollupStats,
    log ``batch_summary``, return (results, rollup).
@@ -53,6 +56,10 @@ I4: backend.generate is never called if coverage has not passed.
 I5: backend.generate is never called if grammar is empty or build failed.
 I6: Token audit failure → translation is empty (not the model text).
 I7: Accepted result only when coverage_pass=True AND token_audit.passed=True.
+I8: Backend generation failure (any exception) → hard_failure, no retry,
+    remaining items continue unaffected.
+I9: Exactly one terminal event {success, hard_failure} per item in the log.
+    provenance is additional (not a terminal).
 """
 
 from __future__ import annotations
@@ -79,6 +86,7 @@ from constrained_translation.rollup import RollupStats
 from constrained_translation.token_auditor import TokenAuditor, TokenLicense
 from constrained_translation.unk_detector import UNKDetector
 from constrained_translation.vocab_extractor import VocabExtractor
+from constrained_translation.vllm_backend import BackendError
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +166,7 @@ class BatchRunner:
         target_file: str,
         backend: BackendProtocol,
         log_path: str,
-        max_retries: int = 3,
+        max_retries: int = 2,
         n_semantic: int = 5,
         n_coverage: int = 5,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
@@ -422,12 +430,33 @@ class BatchRunner:
 
         # ── Generate (grammar must be non-empty — invariant I5) ───────────
         assert grammar_str, "Grammar must be non-empty before calling generate()"
-        gen_result: GenerationResult = self._backend.generate(
-            prompt=prompt,
-            grammar=grammar_str,
-            max_tokens=self._max_tokens,
-            temperature=self._temperature,
-        )
+        try:
+            gen_result: GenerationResult = self._backend.generate(
+                prompt=prompt,
+                grammar=grammar_str,
+                max_tokens=self._max_tokens,
+                temperature=self._temperature,
+            )
+        except Exception as exc:  # noqa: BLE001 — BackendError or any backend failure
+            logger.log(
+                "hard_failure",
+                item_id=item_id,
+                reason="backend_generation_failure",
+                error=str(exc),
+                retry_count=retry_count,
+            )
+            return TranslationResult(
+                item_id=item_id,
+                source_text=source_text,
+                translation="",
+                coverage_pass=True,
+                retry_count=retry_count,
+                hard_failure=True,
+                generation_result=None,
+                token_audit=None,
+                request=request,
+                error=f"Backend generation failed: {exc}",
+            )
 
         # ── Token audit ───────────────────────────────────────────────────
         all_examples = list(examples)
@@ -439,7 +468,13 @@ class BatchRunner:
         )
 
         if not audit_result.passed:
-            # Token audit failed → hard failure; reject model text
+            # Token audit failed → log violation event, then hard failure; reject model text
+            logger.log(
+                "token_audit_violation",
+                item_id=item_id,
+                violations=audit_result.violations,
+                retry_count=retry_count,
+            )
             logger.log(
                 "hard_failure",
                 item_id=item_id,
@@ -461,13 +496,18 @@ class BatchRunner:
                 error="Token audit failed: " + "; ".join(audit_result.violations[:3]),
             )
 
-        # ── Accepted — log provenance ─────────────────────────────────────
+        # ── Accepted — log provenance and success ────────────────────────
         # Convert int keys to strings for JSON serialization
         json_provenance = {str(k): v for k, v in provenance_map.items()}
         logger.log(
             "provenance",
             item_id=item_id,
             token_to_verse=json_provenance,
+            retry_count=retry_count,
+        )
+        logger.log(
+            "success",
+            item_id=item_id,
             retry_count=retry_count,
         )
 

@@ -1029,3 +1029,301 @@ class TestExpandedRetrieval:
 
         # generate must not be called during coverage-gap retries
         mock_backend.generate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# §13  Backend generation failure → hard_failure, no retry, continue batch
+# ---------------------------------------------------------------------------
+
+class TestBackendGenerationFailure:
+    """BackendError (or any exception) from generate() must be caught per-item,
+    logged as hard_failure(reason='backend_generation_failure'), and the runner
+    must continue processing remaining items without retrying unconstrained.
+    """
+
+    def _make_backend_that_raises(self, exc):
+        """Return a mock backend whose generate() raises *exc*."""
+        from constrained_translation.fake_backend import FakeBackend
+        mock_backend = MagicMock(spec=FakeBackend)
+        mock_backend.is_available.return_value = True
+        fb = FakeBackend()
+        for line in _TARGET_LINES:
+            fb.tokenize(line)
+        mock_backend.tokenize.side_effect = fb.tokenize
+        mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.generate.side_effect = exc
+        return mock_backend
+
+    def test_backend_error_produces_hard_failure(self, corpus_files, log_path):
+        """BackendError from generate() must yield hard_failure=True for that item."""
+        from constrained_translation.vllm_backend import BackendError
+        backend = self._make_backend_that_raises(BackendError("generate", 500, "server error"))
+        runner = BatchRunner(
+            source_file=corpus_files[0],
+            target_file=corpus_files[1],
+            backend=backend,
+            log_path=log_path,
+            n_semantic=5,
+            n_coverage=5,
+        )
+        items = [BatchItem("GEN 1:3", "God and the light", exclude_idx=None)]
+        results, _ = runner.run(items)
+        assert results[0].hard_failure is True
+
+    def test_backend_error_reason_is_backend_generation_failure(self, corpus_files, log_path):
+        """hard_failure event for backend error must have reason='backend_generation_failure'."""
+        from constrained_translation.vllm_backend import BackendError
+        backend = self._make_backend_that_raises(BackendError("generate", 503, "unavailable"))
+        runner = BatchRunner(
+            source_file=corpus_files[0],
+            target_file=corpus_files[1],
+            backend=backend,
+            log_path=log_path,
+            n_semantic=5,
+            n_coverage=5,
+        )
+        items = [BatchItem("GEN 1:3", "God and the light", exclude_idx=None)]
+        runner.run(items)
+        events = _read_events(log_path)
+        hf = [e for e in events if e["event"] == "hard_failure"]
+        assert len(hf) >= 1
+        assert hf[0].get("reason") == "backend_generation_failure"
+
+    def test_backend_error_does_not_retry_unconstrained(self, corpus_files, log_path):
+        """BackendError must NOT trigger a retry; generate() should be called exactly once."""
+        from constrained_translation.vllm_backend import BackendError
+        backend = self._make_backend_that_raises(BackendError("generate", 500, "err"))
+        runner = BatchRunner(
+            source_file=corpus_files[0],
+            target_file=corpus_files[1],
+            backend=backend,
+            log_path=log_path,
+            max_retries=3,
+            n_semantic=5,
+            n_coverage=5,
+        )
+        items = [BatchItem("GEN 1:3", "God and the light", exclude_idx=None)]
+        runner.run(items)
+        # generate should have been called exactly once — no retry on backend failure
+        assert backend.generate.call_count == 1
+
+    def test_backend_error_runner_continues_remaining_items(self, corpus_files, log_path):
+        """After a backend error on item 1, item 2 must still be processed."""
+        from constrained_translation.vllm_backend import BackendError
+        fb = FakeBackend()
+        for line in _TARGET_LINES:
+            fb.tokenize(line)
+
+        # generate raises on first call, succeeds on subsequent calls
+        call_count = [0]
+        def generate_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise BackendError("generate", 500, "first call fails")
+            # Return a valid GenerationResult for subsequent calls
+            response = "Dieu créa les cieux"
+            return GenerationResult(
+                text=response,
+                token_ids=fb.tokenize(response),
+                prompt_tokens=10,
+                output_tokens=len(response.split()),
+                generation_ms=50.0,
+            )
+
+        mock_backend = MagicMock(spec=FakeBackend)
+        mock_backend.is_available.return_value = True
+        mock_backend.tokenize.side_effect = fb.tokenize
+        mock_backend.decode_token.side_effect = fb.decode_token
+        mock_backend.generate.side_effect = generate_side_effect
+
+        runner = BatchRunner(
+            source_file=corpus_files[0],
+            target_file=corpus_files[1],
+            backend=mock_backend,
+            log_path=log_path,
+            n_semantic=5,
+            n_coverage=5,
+        )
+        items = [
+            BatchItem("GEN 1:3", "God and the light", exclude_idx=None),
+            BatchItem("GEN 1:4", "God and the light", exclude_idx=None),
+        ]
+        results, _ = runner.run(items)
+        assert len(results) == 2
+        # First item must be a hard failure
+        assert results[0].hard_failure is True
+        # Second item got a generate call (may pass or fail audit, but was attempted)
+        assert mock_backend.generate.call_count >= 2
+
+    def test_generic_exception_from_generate_is_hard_failure(self, corpus_files, log_path):
+        """Any exception from generate() (not just BackendError) must be a hard failure."""
+        backend = self._make_backend_that_raises(RuntimeError("unexpected backend crash"))
+        runner = BatchRunner(
+            source_file=corpus_files[0],
+            target_file=corpus_files[1],
+            backend=backend,
+            log_path=log_path,
+            n_semantic=5,
+            n_coverage=5,
+        )
+        items = [BatchItem("GEN 1:3", "God and the light", exclude_idx=None)]
+        results, _ = runner.run(items)
+        assert results[0].hard_failure is True
+
+    def test_backend_error_generation_result_is_none(self, corpus_files, log_path):
+        """On backend generation failure, generation_result must be None."""
+        from constrained_translation.vllm_backend import BackendError
+        backend = self._make_backend_that_raises(BackendError("generate", 500, "err"))
+        runner = BatchRunner(
+            source_file=corpus_files[0],
+            target_file=corpus_files[1],
+            backend=backend,
+            log_path=log_path,
+            n_semantic=5,
+            n_coverage=5,
+        )
+        items = [BatchItem("GEN 1:3", "God and the light", exclude_idx=None)]
+        results, _ = runner.run(items)
+        assert results[0].generation_result is None
+
+    def test_backend_error_token_audit_is_none(self, corpus_files, log_path):
+        """On backend generation failure, token_audit must be None."""
+        from constrained_translation.vllm_backend import BackendError
+        backend = self._make_backend_that_raises(BackendError("generate", 500, "err"))
+        runner = BatchRunner(
+            source_file=corpus_files[0],
+            target_file=corpus_files[1],
+            backend=backend,
+            log_path=log_path,
+            n_semantic=5,
+            n_coverage=5,
+        )
+        items = [BatchItem("GEN 1:3", "God and the light", exclude_idx=None)]
+        results, _ = runner.run(items)
+        assert results[0].token_audit is None
+
+
+# ---------------------------------------------------------------------------
+# §14  Explicit event terminals: token_audit_violation, success
+# ---------------------------------------------------------------------------
+
+class TestExplicitTerminalEvents:
+    """Spec requires: 'token_audit_violation' event BEFORE hard_failure on audit
+    rejection, and 'success' event for accepted results. Exactly one terminal
+    event (success OR hard_failure) per item; provenance is additional.
+    """
+
+    def _setup_audit_mock(self, passed: bool, corpus_files, log_path):
+        fb = FakeBackend()
+        for line in _TARGET_LINES:
+            fb.tokenize(line)
+        mock_backend = MagicMock(spec=FakeBackend)
+        mock_backend.is_available.return_value = True
+        mock_backend.tokenize.side_effect = fb.tokenize
+        mock_backend.decode_token.side_effect = fb.decode_token
+        response = "Dieu créa les cieux"
+        mock_backend.generate.return_value = GenerationResult(
+            text=response,
+            token_ids=fb.tokenize(response),
+            prompt_tokens=10,
+            output_tokens=len(response.split()),
+            generation_ms=50.0,
+        )
+        with patch("constrained_translation.batch_runner.TokenAuditor") as MockAuditor:
+            mock_auditor = MagicMock()
+            MockAuditor.return_value = mock_auditor
+            if passed:
+                mock_auditor.audit.return_value = (
+                    TokenAuditResult(passed=True, violations=[]),
+                    {1: [0]},
+                )
+            else:
+                mock_auditor.audit.return_value = (
+                    TokenAuditResult(passed=False, violations=["forced violation"]),
+                    {},
+                )
+            mock_auditor.build_license.return_value = {}
+            runner = BatchRunner(
+                source_file=corpus_files[0],
+                target_file=corpus_files[1],
+                backend=mock_backend,
+                log_path=log_path,
+                n_semantic=5,
+                n_coverage=5,
+            )
+            items = [BatchItem("GEN 1:3", "God and the light", exclude_idx=None)]
+            results, _ = runner.run(items)
+        return results
+
+    def test_token_audit_violation_logged_before_hard_failure(self, corpus_files, log_path):
+        """When audit fails, 'token_audit_violation' must appear in the log before hard_failure."""
+        self._setup_audit_mock(passed=False, corpus_files=corpus_files, log_path=log_path)
+        events = _read_events(log_path)
+        event_names = [e["event"] for e in events]
+        assert "token_audit_violation" in event_names, (
+            f"Expected 'token_audit_violation' event, got: {event_names}"
+        )
+        # And hard_failure must also be there
+        assert "hard_failure" in event_names
+
+    def test_token_audit_violation_precedes_hard_failure_in_log(self, corpus_files, log_path):
+        """'token_audit_violation' must be logged before 'hard_failure' for the same item."""
+        self._setup_audit_mock(passed=False, corpus_files=corpus_files, log_path=log_path)
+        events = _read_events(log_path)
+        item_events = [e for e in events if e.get("item_id") == "GEN 1:3"]
+        names = [e["event"] for e in item_events]
+        if "token_audit_violation" in names and "hard_failure" in names:
+            idx_violation = names.index("token_audit_violation")
+            idx_hf = names.index("hard_failure")
+            assert idx_violation < idx_hf, (
+                "token_audit_violation must precede hard_failure in the log"
+            )
+
+    def test_success_event_logged_on_accepted_result(self, corpus_files, log_path):
+        """When audit passes, a 'success' event must be logged."""
+        self._setup_audit_mock(passed=True, corpus_files=corpus_files, log_path=log_path)
+        events = _read_events(log_path)
+        event_names = [e["event"] for e in events]
+        assert "success" in event_names, (
+            f"Expected 'success' event for accepted result, got: {event_names}"
+        )
+
+    def test_exactly_one_terminal_per_item_on_success(self, corpus_files, log_path):
+        """Exactly one terminal event (success or hard_failure) per item on success path."""
+        self._setup_audit_mock(passed=True, corpus_files=corpus_files, log_path=log_path)
+        events = _read_events(log_path)
+        terminal_types = {"success", "hard_failure"}
+        item_terminals = [
+            e for e in events
+            if e.get("item_id") == "GEN 1:3" and e["event"] in terminal_types
+        ]
+        assert len(item_terminals) == 1, (
+            f"Expected exactly 1 terminal event, got {len(item_terminals)}: {item_terminals}"
+        )
+
+    def test_exactly_one_terminal_per_item_on_audit_failure(self, corpus_files, log_path):
+        """Exactly one terminal event (hard_failure) per item on audit failure path."""
+        self._setup_audit_mock(passed=False, corpus_files=corpus_files, log_path=log_path)
+        events = _read_events(log_path)
+        terminal_types = {"success", "hard_failure"}
+        item_terminals = [
+            e for e in events
+            if e.get("item_id") == "GEN 1:3" and e["event"] in terminal_types
+        ]
+        assert len(item_terminals) == 1, (
+            f"Expected exactly 1 terminal event (hard_failure), got {len(item_terminals)}: {item_terminals}"
+        )
+        assert item_terminals[0]["event"] == "hard_failure"
+
+
+# ---------------------------------------------------------------------------
+# §15  max_retries default is 2
+# ---------------------------------------------------------------------------
+
+class TestMaxRetriesDefault:
+    def test_default_max_retries_is_2(self):
+        """BatchRunner default max_retries must be 2."""
+        import inspect
+        sig = inspect.signature(BatchRunner.__init__)
+        default = sig.parameters["max_retries"].default
+        assert default == 2, f"Expected max_retries default=2, got {default}"
