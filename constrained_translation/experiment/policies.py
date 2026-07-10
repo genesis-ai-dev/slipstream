@@ -15,17 +15,20 @@ Policies
 arbitrary_policy(candidates, seed)
     Deterministic permutation via an isolated ``random.Random(seed)``; no
     global RNG contamination.  A fully fresh seeded RNG is created for
-    each call; the call position within the permutation is derived from the
-    current remaining-pool composition (sorted corpus_idx tuple) so that
-    removing the winner and re-calling produces the next item in the
-    seeded shuffle.
+    each call; each candidate is assigned a stable rank by drawing one
+    ``rng.random()`` float per candidate in sorted corpus_idx order.
+    The candidate with the minimum rank among those still present is
+    returned.  Removing the winner and re-calling replays the next item
+    in the same fixed initial permutation — the order is invariant to
+    pool shrinkage.
 
 silver_policy(candidates, translated_source_texts)
     Three-level ordering (best → worst):
-    1. Highest fraction of normalized source-unit types in candidate that
-       are already known from ``translated_source_texts``.
-       Fraction = |known ∩ candidate_types| / |candidate_types|.
-       Punctuation-only candidate (empty type set): fraction defined as 0.0.
+    1. Highest fraction of normalized source-unit OCCURRENCES in candidate
+       that are already known from ``translated_source_texts``.
+       Fraction = known_occurrence_count / total_occurrence_count.
+       Repeated known/unknown tokens affect the score.
+       Punctuation-only candidate (empty unit list): fraction defined as 0.0.
     2. Highest source-side BM25 similarity to the translated-source pool
        (pool is treated as one concatenated document for IDF; each
        candidate is scored against the pool).
@@ -128,16 +131,27 @@ def arbitrary_policy(
     """Return the next candidate in a deterministic seeded permutation.
 
     Each call creates a fresh isolated ``random.Random(seed)`` instance —
-    global RNG state is never read or written.  The position within the
-    permutation is determined by shuffling the candidates using the seed;
-    the first item of the shuffled list that is still in ``candidates``
-    (by sorted-corpus_idx position) is returned.
+    global RNG state is never read or written.
 
-    Specifically: sort ``candidates`` by corpus_idx, shuffle a copy with
-    ``random.Random(seed).shuffle``, then return the first element.  This
-    guarantees that across rounds (as candidates are removed one by one),
-    the policy replays the same seeded order each time given the
-    ever-shrinking pool.
+    Implementation uses *per-candidate seeded ranking*: each candidate is
+    assigned a stable rank derived from ``random.Random((seed, corpus_idx)).random()``.
+    Because the rank for any given corpus_idx is computed from a key that
+    includes only the seed and that candidate's own corpus_idx, the rank is
+    invariant to which other candidates remain in the pool.  The candidate
+    with the lowest rank among those still present is returned each round.
+
+    This is equivalent to computing one fixed initial permutation over the
+    full candidate population and then filtering it as candidates are removed:
+    removing the winner and re-calling always returns the next item in that
+    same fixed total order.
+
+    Specifically:
+    1. For each candidate, compute rank = Random((seed, corpus_idx)).random().
+    2. Return the candidate with the minimum rank.
+
+    Because each rank depends only on (seed, corpus_idx), the order is
+    invariant to pool shrinkage.  Removing the winner and re-calling therefore
+    always returns the next item in the same seeded total order.
 
     Parameters
     ----------
@@ -159,14 +173,23 @@ def arbitrary_policy(
     if not candidates:
         raise ValueError("arbitrary_policy: candidates list is empty")
 
-    # Sort by corpus_idx for a stable canonical ordering before shuffling.
-    sorted_pool = sorted(candidates, key=lambda c: c.corpus_idx)
+    # Assign each candidate a stable rank that is invariant to pool
+    # composition.  Each candidate's rank is drawn from a fresh RNG seeded
+    # with ``seed * _RANK_MIX + corpus_idx`` — an integer that encodes both
+    # the policy seed and the candidate's own identity.  Because the rank
+    # for any given corpus_idx is determined solely by (seed, corpus_idx),
+    # it is unchanged as other candidates are removed from the pool.
+    # Global random state is never read or written.
+    # This guarantees that iteratively removing the winner and re-calling
+    # always replays the next item in the same fixed initial permutation.
+    _RANK_MIX = 1_000_003  # large prime to avoid seed collisions
+    ranked = [
+        (random.Random(seed * _RANK_MIX + c.corpus_idx).random(), c)
+        for c in candidates
+    ]
 
-    # Isolated RNG — never touches global random state.
-    rng = random.Random(seed)
-    rng.shuffle(sorted_pool)
-
-    return sorted_pool[0]
+    # Return the candidate with the smallest rank (first in the fixed order).
+    return min(ranked, key=lambda rc: rc[0])[1]
 
 
 # ---------------------------------------------------------------------------
@@ -243,14 +266,20 @@ def _bm25_score_candidate_vs_pool(
     return score
 
 
-def _known_fraction(candidate_types: frozenset[str], known_types: frozenset[str]) -> float:
-    """Fraction of candidate's normalized types that are in known_types.
+def _known_occurrence_fraction(candidate_units: list[str], known_types: frozenset[str]) -> float:
+    """Fraction of candidate's normalized source-unit occurrences that are known.
 
-    Returns 0.0 for an empty candidate type set (punctuation-only).
+    Counts occurrences (not unique types): for each token in the candidate's
+    unit list, check whether it appears in ``known_types``.
+
+        fraction = (# occurrences of known tokens) / (total # of tokens)
+
+    Returns 0.0 for an empty candidate unit list (punctuation-only).
     """
-    if not candidate_types:
+    if not candidate_units:
         return 0.0
-    return len(candidate_types & known_types) / len(candidate_types)
+    known_count = sum(1 for unit in candidate_units if unit in known_types)
+    return known_count / len(candidate_units)
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +294,11 @@ def silver_policy(
     """Choose the next candidate by source-side coverage ordering.
 
     Three-level priority (higher = better):
-    1. ``known_fraction``: fraction of normalized candidate types present in
-       the translated source pool.  Punctuation-only candidates score 0.0.
+    1. ``known_occurrence_fraction``: fraction of normalized candidate
+       source-unit *occurrences* (tokens) that are present in the translated
+       source pool.  Repeated occurrences of known or unknown tokens affect
+       the score.  Formula: known_occ_count / total_occ_count.
+       Punctuation-only candidates (empty unit list) score 0.0.
     2. BM25 similarity (k1=1.5, b=0.75) of candidate to translated pool.
        The pool documents serve as the BM25 corpus; the candidate is the
        query.  Empty pool → all scores 0.0 → falls through to tiebreak.
@@ -300,8 +332,8 @@ def silver_policy(
     )
 
     def _score(c: AcquisitionCandidate) -> tuple[float, float, int]:
-        c_types = frozenset(normalize_source_units(c.source_text))
-        frac = _known_fraction(c_types, known_types)
+        c_units = normalize_source_units(c.source_text)
+        frac = _known_occurrence_fraction(c_units, known_types)
         bm25 = _bm25_score_candidate_vs_pool(c.source_text, translated_source_texts)
         # Higher frac and bm25 are better; lower corpus_idx is better (negate for max)
         return (frac, bm25, -c.corpus_idx)

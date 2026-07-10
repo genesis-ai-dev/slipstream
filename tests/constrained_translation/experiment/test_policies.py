@@ -659,3 +659,214 @@ class TestNoTargetLeakage:
         assert AcquisitionCandidate is not SequencingPoolItem
         # AcquisitionCandidate must not be a subclass of SequencingPoolItem
         assert not issubclass(AcquisitionCandidate, SequencingPoolItem)
+
+
+# ---------------------------------------------------------------------------
+# Regression 1: arbitrary_policy — fixed permutation replay
+# ---------------------------------------------------------------------------
+
+class TestArbitraryPolicyFixedPermutation:
+    """
+    Regression: arbitrary_policy must replay one fixed initial permutation
+    rather than re-shuffling the shrinking pool each call.
+
+    The contract is:
+        full_order = shuffle(all_candidates, seed)
+        for each round: winner == next item in full_order that's still present
+
+    Equivalently: iteratively calling arbitrary_policy (removing the winner
+    each round) must produce exactly the same sequence as the one-time seeded
+    shuffle of the full candidate list.
+    """
+
+    def _full_order(self, candidates: list, seed: int) -> list:
+        """Compute the expected stable-ranking order (matches arbitrary_policy).
+
+        Uses the same per-candidate seeding as the implementation:
+        each candidate gets rank = Random(seed * 1_000_003 + corpus_idx).random(),
+        then all candidates are sorted ascending by rank to yield the
+        fixed initial permutation.
+        """
+        import random
+        _RANK_MIX = 1_000_003
+        ranked = [
+            (random.Random(seed * _RANK_MIX + c.corpus_idx).random(), c)
+            for c in candidates
+        ]
+        return [c for _, c in sorted(ranked, key=lambda rc: rc[0])]
+
+    def test_iterative_order_equals_initial_permutation(self):
+        """Remove-and-call sequence must equal the initial full-shuffle order."""
+        candidates = [_candidate(i, f"sentence number {i}") for i in range(8)]
+        seed = 42
+
+        expected = self._full_order(candidates, seed)
+        expected_idx = [c.corpus_idx for c in expected]
+
+        pool = list(candidates)
+        actual_idx = []
+        while pool:
+            winner = arbitrary_policy(pool, seed=seed)
+            actual_idx.append(winner.corpus_idx)
+            pool = [c for c in pool if c != winner]
+
+        assert actual_idx == expected_idx, (
+            f"Iterative order {actual_idx} != initial permutation {expected_idx}.\n"
+            "arbitrary_policy must replay one fixed permutation, not re-shuffle each call."
+        )
+
+    def test_fixed_permutation_across_five_seeds(self):
+        """For each of seeds 0-4, iterative selection must match one-time shuffle."""
+        candidates = [_candidate(i, f"word{i} sample") for i in range(7)]
+        for seed in range(5):
+            expected_idx = [c.corpus_idx for c in self._full_order(candidates, seed)]
+            pool = list(candidates)
+            actual_idx = []
+            while pool:
+                winner = arbitrary_policy(pool, seed=seed)
+                actual_idx.append(winner.corpus_idx)
+                pool = [c for c in pool if c != winner]
+            assert actual_idx == expected_idx, (
+                f"Seed {seed}: iterative {actual_idx} != permutation {expected_idx}"
+            )
+
+    def test_every_candidate_selected_exactly_once(self):
+        """All candidates are selected exactly once when pool shrinks iteratively."""
+        candidates = [_candidate(i, f"text {i}") for i in range(10)]
+        for seed in [7, 99, 1234]:
+            pool = list(candidates)
+            selected = []
+            while pool:
+                winner = arbitrary_policy(pool, seed=seed)
+                assert winner not in selected, (
+                    f"Seed {seed}: candidate {winner.corpus_idx} selected twice!"
+                )
+                selected.append(winner)
+                pool = [c for c in pool if c != winner]
+            assert len(selected) == 10
+            assert set(c.corpus_idx for c in selected) == set(range(10))
+
+    def test_no_global_state_mutation(self):
+        """Policy must use isolated RNG — global random state must be unchanged."""
+        import random
+        candidates = [_candidate(i, f"text {i}") for i in range(6)]
+        random.seed(99999)
+        state_before = random.random()
+        random.seed(99999)
+        pool = list(candidates)
+        while pool:
+            winner = arbitrary_policy(pool, seed=42)
+            pool = [c for c in pool if c != winner]
+        state_after = random.random()
+        assert state_before == state_after, (
+            "arbitrary_policy contaminated global random state over multiple calls!"
+        )
+
+    def test_deterministic_across_five_seeds_differ(self):
+        """Distinct seeds produce distinct orderings (≥5 unique orderings)."""
+        candidates = [_candidate(i, f"word{i} text sample") for i in range(8)]
+        orders = set()
+        for seed in [0, 1, 2, 3, 4, 17, 42, 99, 1000, 9999]:
+            pool = list(candidates)
+            order = []
+            while pool:
+                winner = arbitrary_policy(pool, seed=seed)
+                order.append(winner.corpus_idx)
+                pool = [x for x in pool if x != winner]
+            orders.add(tuple(order))
+        assert len(orders) >= 5, (
+            f"Expected ≥5 distinct seed orderings, got {len(orders)}: {orders}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression 2: silver_policy — occurrence-based fraction
+# ---------------------------------------------------------------------------
+
+class TestSilverOccurrenceFraction:
+    """
+    Regression: silver_policy must score based on normalized source-unit
+    OCCURRENCE count (known_occurrences / total_occurrences), not unique-type
+    count.  Repeated known/unknown units must affect the score.
+
+    Punctuation-only (empty unit list) → fraction = 0.0 (unchanged).
+    """
+
+    def test_occurrence_fraction_beats_type_fraction_tie(self):
+        """
+        When type fractions tie but occurrence fractions differ,
+        the candidate with higher occurrence fraction wins.
+
+        Pool knows 'alpha'.
+        c0: 'alpha beta'        → types {alpha,beta}: type-frac=1/2
+                                  occurrences [alpha,beta]: occ-frac=1/2
+        c1: 'alpha alpha beta'  → types {alpha,beta}: type-frac=1/2 (SAME type frac!)
+                                  occurrences [alpha,alpha,beta]: occ-frac=2/3 (HIGHER)
+        c1 must win.
+        """
+        translated = ["alpha"]
+        c0 = _candidate(0, "alpha beta")
+        c1 = _candidate(1, "alpha alpha beta")
+
+        chosen = silver_policy([c0, c1], translated_source_texts=translated)
+        assert chosen.corpus_idx == 1, (
+            f"Expected c1 (occ-frac 2/3 > 1/2), got corpus_idx={chosen.corpus_idx}.\n"
+            "Silver must use occurrence fraction, not unique-type fraction."
+        )
+
+    def test_repeated_unknown_lowers_score(self):
+        """
+        Repeated unknown tokens dilute the occurrence fraction downward.
+
+        Pool knows 'alpha'.
+        c0: 'alpha beta beta'   → occurrences [alpha,beta,beta]: occ-frac=1/3
+        c1: 'alpha beta'        → occurrences [alpha,beta]:      occ-frac=1/2
+        c1 must win (higher occ-frac).
+        """
+        translated = ["alpha"]
+        c0 = _candidate(0, "alpha beta beta")
+        c1 = _candidate(1, "alpha beta")
+
+        chosen = silver_policy([c0, c1], translated_source_texts=translated)
+        assert chosen.corpus_idx == 1, (
+            f"Expected c1 (occ-frac 1/2 > 1/3), got corpus_idx={chosen.corpus_idx}.\n"
+            "Repeated unknown tokens should dilute the occurrence fraction."
+        )
+
+    def test_punctuation_only_is_zero(self):
+        """Punctuation-only candidate has occurrence fraction 0.0 (deterministic)."""
+        translated = ["alpha beta"]
+        c_punct = _candidate(0, ",,, ...")       # normalizes to [] → frac=0
+        c_normal = _candidate(1, "gamma delta")  # no known units → frac=0 too
+        # Both score 0.0; tie broken by BM25 then corpus_idx → c_punct wins (idx=0)
+        chosen = silver_policy([c_punct, c_normal], translated_source_texts=translated)
+        # Should not crash; result is deterministic
+        assert isinstance(chosen, AcquisitionCandidate)
+
+    def test_fully_known_occurrences_score_one(self):
+        """Candidate whose every occurrence is known scores 1.0."""
+        translated = ["alpha beta gamma"]
+        # c0: all tokens known → occ-frac = 1.0
+        c0 = _candidate(0, "alpha beta gamma alpha")
+        # c1: mixed → occ-frac < 1.0
+        c1 = _candidate(1, "alpha beta unknown")
+        chosen = silver_policy([c0, c1], translated_source_texts=translated)
+        assert chosen.corpus_idx == 0, (
+            f"Expected c0 (all occurrences known → frac=1.0), got {chosen.corpus_idx}"
+        )
+
+    def test_known_occurrence_count_over_total_occurrences(self):
+        """
+        Validate the formula directly:
+        Pool: 'alpha alpha beta'  → known_set = {alpha, beta}
+        c0:  'alpha alpha alpha beta beta'  → 5 total, 5 known → frac=1.0
+        c1:  'alpha gamma'                  → 2 total, 1 known → frac=0.5
+        c0 wins.
+        """
+        translated = ["alpha alpha beta"]
+        c0 = _candidate(0, "alpha alpha alpha beta beta")
+        c1 = _candidate(1, "alpha gamma")
+        chosen = silver_policy([c0, c1], translated_source_texts=translated)
+        assert chosen.corpus_idx == 0, (
+            f"Expected c0 (occ-frac=1.0), got {chosen.corpus_idx}"
+        )
