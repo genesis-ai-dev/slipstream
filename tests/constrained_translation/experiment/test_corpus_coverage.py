@@ -624,12 +624,12 @@ class TestMarginalGain:
         assert nt == 0
 
     def test_weighted_gain_candidate_not_in_project(self):
-        """Types in candidate not in project freq_index don't contribute to weighted_gain,
-        but do contribute to new_type_count."""
+        """Types in candidate not in project freq_index contribute 0 to both
+        weighted_gain and new_type_count (project-gain semantics)."""
         ps = self._ps_3()
         wg, nt = marginal_gain("totally_foreign", ps, known_types=frozenset())
         assert wg == 0      # not in project
-        assert nt == 1      # new type even if not in project
+        assert nt == 0      # off-project type yields zero unweighted gain
 
     def test_weighted_gain_uses_normalize_source_units(self):
         """Candidate is normalized before lookup."""
@@ -774,12 +774,12 @@ class TestEdgeCases:
         assert stats1.weighted_unknown_occurrences == stats2.weighted_unknown_occurrences
 
     def test_candidate_with_types_absent_from_project(self):
-        """marginal_gain with candidate whose types aren't in project → weighted_gain=0."""
+        """marginal_gain with candidate whose types aren't in project → both gains are 0."""
         items = [_make_item(0, "alpha beta")]
         ps = build_project_slice(_make_manifest(items))
         wg, nt = marginal_gain("xyz xyz_foreign", ps, known_types=frozenset())
         assert wg == 0
-        assert nt == 2  # new types even though not in project
+        assert nt == 0  # off-project types yield zero unweighted gain
 
     def test_repeated_units_within_sentence_occurrence_count(self):
         """freq_index correctly counts all occurrences within a sentence."""
@@ -816,3 +816,193 @@ class TestEdgeCases:
         item = _make_item(0, "hello world")
         ps = build_project_slice(_make_manifest([item]))
         assert "hello" in ps.freq_index
+
+
+# ---------------------------------------------------------------------------
+# Class 10: Ranking regression — off-project vocabulary cannot tie
+# ---------------------------------------------------------------------------
+
+class TestMarginalGainRanking:
+    """Irrelevant vocabulary (types absent from project) must score (0, 0),
+    which cannot tie a project-covering candidate that scores (>0, >0)."""
+
+    def _ps(self):
+        items = [
+            _make_item(0, "alpha beta"),
+            _make_item(1, "gamma delta"),
+        ]
+        return build_project_slice(_make_manifest(items))
+
+    def test_off_project_candidate_scores_zero_zero(self):
+        """A candidate with only off-project types gets (0, 0)."""
+        ps = self._ps()
+        wg, nt = marginal_gain("foreign_word another_foreign", ps, known_types=frozenset())
+        assert wg == 0
+        assert nt == 0
+
+    def test_on_project_candidate_beats_off_project(self):
+        """A project-covering candidate ranks strictly above an off-project one."""
+        ps = self._ps()
+        wg_on, nt_on = marginal_gain("alpha beta", ps, known_types=frozenset())
+        wg_off, nt_off = marginal_gain("foreign_word", ps, known_types=frozenset())
+        assert wg_on > wg_off
+        assert nt_on > nt_off
+
+    def test_mixed_candidate_only_counts_project_types(self):
+        """A candidate with both project and off-project types: only project types count."""
+        ps = self._ps()
+        # "alpha" is in project (freq=1), "foreign" is not
+        wg_mixed, nt_mixed = marginal_gain("alpha foreign", ps, known_types=frozenset())
+        wg_pure, nt_pure = marginal_gain("alpha", ps, known_types=frozenset())
+        # Mixed should equal pure project candidate (foreign adds nothing)
+        assert wg_mixed == wg_pure
+        assert nt_mixed == nt_pure
+
+
+# ---------------------------------------------------------------------------
+# Class 11: UNK span parity — coverage stats vs UNKDetector
+# ---------------------------------------------------------------------------
+
+class TestUNKSpanParity:
+    """Parity between _unsupported_spans_for (used by corpus_coverage) and
+    UNKDetector.detect, across punctuation, adjacent runs, Unicode/RTL,
+    offsets, empty input, and repeated units.
+
+    The two use compatible algorithms (same tokenizer, same normalizer, same
+    merge logic).  Given equivalent known evidence, they must produce
+    identical UNKSpan values.
+    """
+
+    from constrained_translation.unk_detector import UNKDetector as _UNKDetector
+
+    def _spans_from_coverage(self, source_text: str, known_words: list[str]) -> tuple:
+        """Get unsupported spans via corpus_coverage path."""
+        items = [_make_item(0, source_text)]
+        ps = build_project_slice(_make_manifest(items))
+        # known_words are the "translated source cells"
+        stats = compute_coverage_stats(ps, translated_source_cells=known_words)
+        return stats.unsupported_spans.get(0, ())
+
+    def _spans_from_unk_detector(self, source_text: str, known_words: list[str]) -> tuple:
+        """Get spans via UNKDetector using known_words as attested_vocab."""
+        from constrained_translation.unk_detector import UNKDetector
+        vocab = frozenset(known_words)
+        return UNKDetector().detect(source_text, vocab)
+
+    def test_parity_empty_input(self):
+        cov = self._spans_from_coverage("", [])
+        unk = self._spans_from_unk_detector("", [])
+        assert cov == unk == ()
+
+    def test_parity_all_known(self):
+        source = "alpha beta gamma"
+        known = ["alpha beta gamma"]
+        cov = self._spans_from_coverage(source, known)
+        unk = self._spans_from_unk_detector(source, ["alpha", "beta", "gamma"])
+        assert cov == unk == ()
+
+    def test_parity_none_known(self):
+        source = "alpha beta gamma"
+        cov = self._spans_from_coverage(source, [])
+        unk = self._spans_from_unk_detector(source, [])
+        assert cov == unk
+        assert len(cov) == 1
+        assert cov[0].surface == "alpha beta gamma"
+        assert cov[0].start_char == 0
+        assert cov[0].end_char == len(source)
+
+    def test_parity_punctuation_only_transparent(self):
+        """A punctuation-only token ',' is never a UNK span in either path."""
+        source = "alpha , beta"
+        known = ["alpha", "beta"]
+        cov = self._spans_from_coverage(source, known)
+        unk = self._spans_from_unk_detector(source, ["alpha", "beta"])
+        assert cov == unk == ()
+
+    def test_parity_adjacent_unk_runs_merged(self):
+        """Two adjacent unknown tokens merge into one span in both paths."""
+        source = "alpha unknown1 unknown2 beta"
+        known = ["alpha", "beta"]
+        cov = self._spans_from_coverage(source, known)
+        unk = self._spans_from_unk_detector(source, ["alpha", "beta"])
+        assert cov == unk
+        assert len(cov) == 1
+        assert cov[0].surface == "unknown1 unknown2"
+
+    def test_parity_unicode_rtl(self):
+        """Unicode/RTL text produces identical spans in both paths."""
+        source = "שָׁלוֹם unknown מרחבא"
+        known = ["שָׁלוֹם", "מרחבא"]
+        cov = self._spans_from_coverage(source, known)
+        unk = self._spans_from_unk_detector(source, known)
+        assert cov == unk
+
+    def test_parity_offsets_match_source_slice(self):
+        """start_char/end_char in both paths correctly slice source_text."""
+        source = "known1 unk_word known2"
+        known = ["known1", "known2"]
+        cov = self._spans_from_coverage(source, known)
+        unk = self._spans_from_unk_detector(source, ["known1", "known2"])
+        assert cov == unk
+        for span in cov:
+            assert source[span.start_char:span.end_char] == span.surface
+
+    def test_parity_repeated_units(self):
+        """Repeated units in source handled identically."""
+        source = "foo foo foo bar"
+        known = ["foo"]
+        cov = self._spans_from_coverage(source, known)
+        unk = self._spans_from_unk_detector(source, ["foo"])
+        assert cov == unk
+        # bar is unknown
+        assert len(cov) == 1
+        assert cov[0].surface == "bar"
+
+    def test_parity_surface_preserves_original(self):
+        """Surface text preserves original (non-normalized) form in both paths."""
+        source = "known UNKNOWN_WORD other"
+        known = ["known", "other"]
+        cov = self._spans_from_coverage(source, known)
+        unk = self._spans_from_unk_detector(source, ["known", "other"])
+        assert cov == unk
+        assert cov[0].surface == "UNKNOWN_WORD"
+
+
+# ---------------------------------------------------------------------------
+# Class 12: detect_false_source_abstentions — return contract
+# ---------------------------------------------------------------------------
+
+class TestDetectFalseAbstentionContract:
+    """detect_false_source_abstentions must return only nonempty entries
+    (corpus_idx → frozenset[str] only when the frozenset is nonempty)."""
+
+    def test_returns_only_nonempty_entries(self):
+        """Items with no false abstentions must NOT appear in the returned dict."""
+        items = [
+            _make_item(0, "alpha beta unknown_word"),
+            _make_item(1, "gamma delta"),  # no false abstention here
+        ]
+        ps = build_project_slice(_make_manifest(items))
+        stats = compute_coverage_stats(ps, translated_source_cells=["alpha beta", "gamma delta"])
+        # item 1 is fully supported → no false abstentions possible
+        # item 0 has unknown_word genuinely absent from pool
+        false_abs = detect_false_source_abstentions(stats, translated_source_cells=["alpha beta", "gamma delta"])
+        # Keys must only be items WITH false abstentions
+        for corpus_idx, fs in false_abs.items():
+            assert len(fs) > 0, f"corpus_idx={corpus_idx} has empty frozenset in result"
+
+    def test_no_key_for_fully_supported_item(self):
+        """A fully-supported item (no unknowns) must not appear in the result."""
+        items = [_make_item(0, "alpha beta")]
+        ps = build_project_slice(_make_manifest(items))
+        stats = compute_coverage_stats(ps, translated_source_cells=["alpha beta"])
+        false_abs = detect_false_source_abstentions(stats, translated_source_cells=["alpha beta"])
+        assert 0 not in false_abs
+
+    def test_empty_result_when_no_false_abstentions(self):
+        """When no items have false abstentions, result is an empty dict."""
+        items = [_make_item(0, "alpha truly_unknown")]
+        ps = build_project_slice(_make_manifest(items))
+        stats = compute_coverage_stats(ps, translated_source_cells=["alpha"])
+        false_abs = detect_false_source_abstentions(stats, translated_source_cells=["alpha"])
+        assert false_abs == {}

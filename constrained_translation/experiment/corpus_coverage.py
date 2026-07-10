@@ -40,6 +40,9 @@ from constrained_translation.experiment.sequencing_manifest import (
 )
 from constrained_translation.protocol import UNKSpan
 from constrained_translation.text_normalize import normalize_source_units
+from constrained_translation.unk_detector import UNKDetector as _UNKDetector
+
+_unk_detector = _UNKDetector()
 
 
 # ---------------------------------------------------------------------------
@@ -148,69 +151,15 @@ def _unsupported_spans_for(
 ) -> tuple[UNKSpan, ...]:
     """Return UNKSpan tuples for contiguous runs of uncovered tokens in source_text.
 
-    Uses the same algorithm as UNKDetector (whitespace-split, normalize per token,
-    merge adjacent uncovered into one span), but uses ``known_types`` (the
-    coverage-accounting known set) as the lookup rather than ``attested_vocab``.
+    Delegates to ``UNKDetector.detect`` with ``known_types`` as the attested
+    vocabulary.  Since ``known_types`` contains already-normalized units (output
+    of ``normalize_source_units``), the normalization applied inside UNKDetector
+    is idempotent, and the results are identical to a direct lookup.  This
+    eliminates the previously duplicated tokenization/merge algorithm.
+
     Source-side only — no target input.
     """
-    if not source_text or not source_text.strip():
-        return ()
-
-    # Tokenise by whitespace, preserving character offsets
-    tokens: list[tuple[str, int, int]] = []
-    i = 0
-    n = len(source_text)
-    while i < n:
-        while i < n and source_text[i].isspace():
-            i += 1
-        if i >= n:
-            break
-        j = i
-        while j < n and not source_text[j].isspace():
-            j += 1
-        tokens.append((source_text[i:j], i, j))
-        i = j
-
-    if not tokens:
-        return ()
-
-    # Classify each token
-    covered: list[bool] = []
-    for raw_tok, _s, _e in tokens:
-        units = normalize_source_units(raw_tok)
-        if not units:
-            # Punctuation-only: transparent (never UNK)
-            covered.append(True)
-        else:
-            covered.append(all(u in known_types for u in units))
-
-    # Merge adjacent uncovered runs into UNKSpan instances
-    spans: list[UNKSpan] = []
-    run_start: int | None = None
-    for idx, is_covered in enumerate(covered):
-        if not is_covered:
-            if run_start is None:
-                run_start = idx
-        else:
-            if run_start is not None:
-                spans.append(_make_span(source_text, tokens, run_start, idx - 1))
-                run_start = None
-    if run_start is not None:
-        spans.append(_make_span(source_text, tokens, run_start, len(tokens) - 1))
-
-    return tuple(spans)
-
-
-def _make_span(
-    source_text: str,
-    tokens: list[tuple[str, int, int]],
-    first: int,
-    last: int,
-) -> UNKSpan:
-    start_char = tokens[first][1]
-    end_char = tokens[last][2]
-    surface = source_text[start_char:end_char]
-    return UNKSpan(surface=surface, start_char=start_char, end_char=end_char)
+    return _unk_detector.detect(source_text, known_types)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +263,8 @@ def detect_false_source_abstentions(
     -------
     dict[int, frozenset[str]]
         Maps corpus_idx → frozenset of falsely-abstained normalized types.
-        Empty frozenset for items with no false abstentions.
+        Only nonempty entries are returned; items with no false abstentions
+        do not appear as keys.
     """
     translated_types = _build_known_types(translated_source_cells)
     result: dict[int, frozenset[str]] = {}
@@ -350,22 +300,26 @@ def marginal_gain(
     -------
     (weighted_gain, new_type_count)
         weighted_gain: sum of ``freq_index[t]`` for each newly covered type ``t``
-            that also appears in ``freq_index``.
-        new_type_count: count of normalized types in candidate NOT in ``known_types``,
-            regardless of whether they appear in ``freq_index``.
+            that appears in ``freq_index`` (project-present types only).
+        new_type_count: count of normalized types in candidate NOT in ``known_types``
+            AND present in ``project_slice.freq_index``.  Types absent from the
+            project yield zero contribution to both gains.
 
     Notes
     -----
     - Duplicate types within a candidate sentence are deduplicated (set semantics).
-    - Types in candidate but absent from ``freq_index`` contribute 0 to
-      ``weighted_gain`` but 1 each to ``new_type_count``.
+    - Types in candidate but absent from ``freq_index`` contribute 0 to both
+      ``weighted_gain`` and ``new_type_count`` (project-gain semantics).
     """
     candidate_types = frozenset(normalize_source_units(candidate_source_text))
-    new_types = candidate_types - known_types
-
-    weighted_gain = sum(
-        project_slice.freq_index.get(t, 0) for t in new_types
+    freq_index = project_slice.freq_index
+    # Restrict to project-present new types only
+    new_project_types = frozenset(
+        t for t in candidate_types
+        if t not in known_types and t in freq_index
     )
-    new_type_count = len(new_types)
+
+    weighted_gain = sum(freq_index[t] for t in new_project_types)
+    new_type_count = len(new_project_types)
 
     return float(weighted_gain), new_type_count
