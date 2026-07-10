@@ -261,3 +261,123 @@ class TestExampleSelectorDeterminism:
         r1 = sel.select(query, exclude_idx=0)
         r2 = sel.select(query, exclude_idx=0)
         assert r1 == r2, "ExampleSelector must be deterministic"
+
+
+# ---------------------------------------------------------------------------
+# Regression: Stage 2 must target UNCOVERED units, not re-score full query
+# ---------------------------------------------------------------------------
+
+class TestCoverageTargetsUncoveredUnits:
+    """Stage 2 must select examples covering query units NOT present in Stage 1.
+
+    Regression guard: the old Stage 2 called ContextQuery._branching_search on
+    the full original query without knowing which tokens were already covered by
+    Stage 1.  In certain query/corpus configurations this caused the single
+    coverage slot to be consumed by the *same* verse that semantic returned (the
+    branching search scored it highest on the full query), which was then
+    deduplicated away — leaving the coverage stage with zero results even though
+    uncovered query tokens existed in the corpus.
+    """
+
+    def test_coverage_slot_not_wasted_on_already_covered_term(self, tiny_corpus_files):
+        """With n_coverage=1, the one slot must pick a verse covering an uncovered term.
+
+        Setup (tiny corpus):
+          Query = "firmament earth"
+          BM25 semantic top-1 → verse_idx=7
+            "And God made the firmament above the waters"  → covers 'firmament' only.
+          Remaining uncovered query token = {'earth'}.
+          Verses 1, 9 contain 'earth', so there IS a valid coverage target.
+
+        Old (buggy) behaviour:
+          _branching_search("firmament earth", top_k=1, exclude_idx=-1) ALSO
+          returns verse_idx=7 as its best result (same branching-search ranking).
+          Verse 7 is then deduplicated away → 0 coverage examples returned, even
+          though 'earth' is uncovered and reachable in the corpus.
+
+        Correct behaviour:
+          Coverage stage identifies {'earth'} as uncovered, then runs greedy
+          set-cover over eligible rows (those not already selected by semantic).
+          It picks exactly one verse that contains 'earth' and returns it.
+        """
+        import re
+
+        src, tgt = tiny_corpus_files
+        sel = _make_selector(src, tgt, n_semantic=1, n_coverage=1)
+        results = sel.select("firmament earth")  # exclude_idx=None; no held-out verse
+
+        sem_results = [ex for ex in results if ex.selection_method == "semantic"]
+        cov_results = [ex for ex in results if ex.selection_method == "coverage"]
+
+        # ── Stage 1 sanity ──────────────────────────────────────────────────
+        assert len(sem_results) == 1, (
+            f"Expected exactly 1 semantic result, got {len(sem_results)}"
+        )
+
+        # Determine which normalised query tokens semantic covered.
+        query_tokens = {"firmament", "earth"}
+
+        def _tokens(text: str) -> set[str]:
+            return set(re.sub(r"[^\w\s]", "", text.lower()).split())
+
+        sem_covered: set[str] = set()
+        for ex in sem_results:
+            sem_covered |= (_tokens(ex.source) & query_tokens)
+
+        uncovered = query_tokens - sem_covered
+
+        assert uncovered, (
+            f"Test setup invalid: semantic already covered all query tokens "
+            f"({sem_covered}); nothing left to test for coverage stage."
+        )
+
+        # ── Stage 2 core assertion ───────────────────────────────────────────
+        assert len(cov_results) == 1, (
+            f"Coverage stage should have returned 1 result targeting uncovered "
+            f"tokens {uncovered!r}, but returned {len(cov_results)}.  "
+            f"(Old bug: _branching_search also ranked verse_idx=7 first and "
+            f"the only coverage slot was deduped away.)"
+        )
+
+        # The one coverage result must actually cover a previously-uncovered token.
+        cov_tokens = _tokens(cov_results[0].source)
+        newly_covered = cov_tokens & uncovered
+        assert newly_covered, (
+            f"Coverage result (verse_idx={cov_results[0].verse_idx}) covers "
+            f"{cov_tokens & query_tokens!r} but uncovered tokens were "
+            f"{uncovered!r}.  Slot was wasted on already-covered terms."
+        )
+
+    def test_coverage_stops_when_all_units_covered(self, tiny_corpus_files):
+        """When semantic covers every query token, coverage must return 0 results.
+
+        This prevents wasting context-window slots on examples that provide no
+        new lexical coverage.
+        """
+        import re
+
+        src, tgt = tiny_corpus_files
+        # n_semantic=2 is enough to cover both 'light' and 'earth' across two verses.
+        sel = _make_selector(src, tgt, n_semantic=2, n_coverage=3)
+        results = sel.select("light earth", exclude_idx=0)
+
+        sem_results = [ex for ex in results if ex.selection_method == "semantic"]
+        cov_results = [ex for ex in results if ex.selection_method == "coverage"]
+
+        def _tokens(text: str) -> set[str]:
+            return set(re.sub(r"[^\w\s]", "", text.lower()).split())
+
+        query_tokens = {"light", "earth"}
+        sem_covered: set[str] = set()
+        for ex in sem_results:
+            sem_covered |= (_tokens(ex.source) & query_tokens)
+
+        if sem_covered >= query_tokens:
+            # All tokens covered by semantic → coverage must be empty.
+            for ex in cov_results:
+                cov_tokens = _tokens(ex.source)
+                newly = cov_tokens & (query_tokens - sem_covered)
+                assert newly, (
+                    f"Coverage result (verse_idx={ex.verse_idx}) covers no new "
+                    f"query tokens.  All tokens were already in semantic results."
+                )
