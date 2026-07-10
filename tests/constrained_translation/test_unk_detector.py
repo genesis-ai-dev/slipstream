@@ -202,23 +202,21 @@ def test_unk_detector_unicode_nfkc_equivalence():
 
 
 def test_unk_detector_punctuation_attached_to_token():
-    """A source token like 'selah.' whose stripped normalised form is covered
-    — here 'selah' is in vocab — should be treated as covered if the
-    normalised+lowercased full form matches (or per-spec, exact match).
+    """A source token like 'selah.' whose normalised form (after punctuation
+    stripping) is covered — here 'selah' is in vocab — should be treated as
+    COVERED because the shared normalizer strips punctuation before comparison.
 
-    Per spec §7.5 the normalised token is checked AS-IS (whitespace split
-    only, no punctuation stripping on the source side).  So 'selah.' is a
-    different token from 'selah' and is NOT covered if only 'selah' is in
-    the vocab.
+    This is the new unified-normalizer behavior: punctuation is stripped from
+    source tokens before lookup, just as BM25Query._normalize_text strips
+    punctuation from documents.  So 'selah.' → normalises to 'selah' which IS
+    in vocab → covered.
     """
     vocab = _vocab("praise", "selah", "forever")
     source = "praise selah. forever"
-    # "selah." normalises to "selah." (NFKC changes nothing here) — lowercase
-    # is "selah." which != "selah", so it should be uncovered
+    # "selah." strips to "selah" via normalize_source_units → it IS covered.
     detector = UNKDetector()
     spans = detector.detect(source, vocab)
-    assert len(spans) == 1
-    assert spans[0].surface == "selah."
+    assert len(spans) == 0
 
 
 def test_unk_detector_empty_vocab_marks_all_tokens():
@@ -279,3 +277,73 @@ def test_unk_detector_spans_ordered_by_start_char():
     spans = detector.detect(source, vocab)
     start_chars = [s.start_char for s in spans]
     assert start_chars == sorted(start_chars)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests — unified normalizer (commas, quotes, apostrophes, hyphens)
+# ---------------------------------------------------------------------------
+
+def test_unk_detector_trailing_comma_not_bogus_unk():
+    """'you,,' in source must be covered if 'you' is in vocab.
+
+    Regression: old NFKC-only normalization left punctuation attached, so
+    'you,,' != 'you' → bogus UNK.  Unified normalizer strips punctuation.
+    """
+    vocab = _vocab("you")
+    source = "you,,"
+    detector = UNKDetector()
+    spans = detector.detect(source, vocab)
+    assert spans == (), f"Expected no spans, got {spans}"
+
+
+def test_unk_detector_quoted_token_covered():
+    """'\"word\"' in source is covered if 'word' is in vocab."""
+    vocab = _vocab("word")
+    source = '"word"'
+    detector = UNKDetector()
+    spans = detector.detect(source, vocab)
+    assert spans == (), f"Expected no spans, got {spans}"
+
+
+def test_unk_detector_apostrophe_in_token_covered():
+    """'don't' normalises to 'dont' which must match vocab entry 'dont'."""
+    vocab = _vocab("dont")
+    source = "don't"
+    detector = UNKDetector()
+    spans = detector.detect(source, vocab)
+    assert spans == (), f"Expected no spans, got {spans}"
+
+
+def test_unk_detector_hyphenated_token_covered():
+    """'well-known' normalises to 'wellknown'; matched when 'wellknown' is in vocab."""
+    vocab = _vocab("wellknown")
+    source = "well-known"
+    detector = UNKDetector()
+    spans = detector.detect(source, vocab)
+    assert spans == (), f"Expected no spans, got {spans}"
+
+
+def test_unk_detector_punctuation_only_token_not_unk():
+    """A standalone punctuation token like ',' must never become a UNK span."""
+    vocab = _vocab("alpha", "omega")
+    source = "alpha , omega"
+    detector = UNKDetector()
+    spans = detector.detect(source, vocab)
+    assert spans == (), (
+        "Punctuation-only token ',' must be transparent (not a UNK span)"
+    )
+
+
+def test_unk_detector_mixed_punct_token_surface_preserved():
+    """When a token with punctuation IS unknown, its original surface is preserved."""
+    vocab = _vocab("known")
+    source = "known xyzzy, foo"
+    detector = UNKDetector()
+    spans = detector.detect(source, vocab)
+    # 'xyzzy,' -> normalises to 'xyzzy' which is NOT in vocab → UNK span
+    # 'foo' → not in vocab → UNK span; they are adjacent → merged
+    assert len(spans) == 1
+    assert spans[0].surface == "xyzzy, foo"
+    # Original source slice must reconstruct correctly
+    assert source[spans[0].start_char:spans[0].end_char] == spans[0].surface
+

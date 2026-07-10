@@ -53,6 +53,7 @@ import unicodedata
 from typing import Iterable
 
 from constrained_translation.protocol import UNKSpan
+from constrained_translation.text_normalize import normalize_source_units
 
 
 class UNKDetector:
@@ -90,13 +91,12 @@ class UNKDetector:
         if not source_text or not source_text.strip():
             return ()
 
-        # Build a lowercased lookup set.  NFKC normalisation is applied so
-        # that compatibility-equivalent forms (e.g. fullwidth vs. regular)
-        # are treated as the same token.
-        lookup: set[str] = {
-            unicodedata.normalize("NFKC", tok).lower()
-            for tok in attested_vocab
-        }
+        # Build a normalised lookup set from attested_vocab using the same
+        # normalizer that ExampleSelector and BatchRunner use.
+        lookup: set[str] = set()
+        for tok in attested_vocab:
+            units = normalize_source_units(tok)
+            lookup.update(units)
 
         # Tokenise source_text by whitespace, recording character offsets.
         # We iterate manually to capture exact start/end positions.
@@ -120,10 +120,18 @@ class UNKDetector:
             return ()
 
         # Classify each token as covered or uncovered.
+        # A token is *covered* if:
+        #   (a) its normalize_source_units() result is non-empty AND every
+        #       unit appears in the lookup, OR
+        #   (b) it is punctuation-only (normalises to empty) — never UNK.
         covered: list[bool] = []
         for raw_tok, _start, _end in tokens:
-            normalised = unicodedata.normalize("NFKC", raw_tok).lower()
-            covered.append(normalised in lookup)
+            units = normalize_source_units(raw_tok)
+            if not units:
+                # Punctuation-only token: treated as covered / transparent.
+                covered.append(True)
+            else:
+                covered.append(all(u in lookup for u in units))
 
         # Merge adjacent uncovered tokens into contiguous runs.
         spans: list[UNKSpan] = []

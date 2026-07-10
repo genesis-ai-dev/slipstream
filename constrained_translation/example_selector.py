@@ -34,6 +34,7 @@ from __future__ import annotations
 from typing import Optional
 
 from constrained_translation.protocol import AlignedExample
+from constrained_translation.text_normalize import normalize_source_units
 from query.bm25query import BM25Query
 
 
@@ -137,16 +138,14 @@ class ExampleSelector:
         # ----------------------------------------------------------------
         # Stage 2 — greedy set-cover over uncovered query units
         # ----------------------------------------------------------------
-        # Compute normalised query units (tokens after BM25 normalisation).
-        query_units: set[str] = set(
-            self._bm25._normalize_text(query).split()
-        )
+        # Compute normalised query units using shared normalizer.
+        query_units: set[str] = set(normalize_source_units(query))
 
         # Subtract units already covered by semantic stage results.
         covered_units: set[str] = set()
         for ex in semantic_examples:
             covered_units |= (
-                set(self._bm25._normalize_text(ex.source).split()) & query_units
+                set(normalize_source_units(ex.source)) & query_units
             )
 
         remaining_units = query_units - covered_units
@@ -164,11 +163,9 @@ class ExampleSelector:
                 if idx in seen_verse_indices:
                     continue
 
-                doc_tokens = set(
-                    self._bm25._normalize_text(
+                doc_tokens = set(normalize_source_units(
                         self._bm25.source_verses[idx]
-                    ).split()
-                )
+                    ))
                 gain = len(doc_tokens & remaining_units)
                 if gain == 0:
                     continue
@@ -208,9 +205,7 @@ class ExampleSelector:
             )
 
             # Subtract newly covered units.
-            newly_covered = set(
-                self._bm25._normalize_text(source).split()
-            ) & remaining_units
+            newly_covered = set(normalize_source_units(source)) & remaining_units
             remaining_units -= newly_covered
 
         return tuple(semantic_examples + coverage_examples)

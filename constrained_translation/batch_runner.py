@@ -83,6 +83,7 @@ from constrained_translation.protocol import (
     UNKSpan,
 )
 from constrained_translation.rollup import RollupStats
+from constrained_translation.text_normalize import normalize_source_units
 from constrained_translation.token_auditor import TokenAuditor, TokenLicense
 from constrained_translation.unk_detector import UNKDetector
 from constrained_translation.vocab_extractor import VocabExtractor
@@ -543,14 +544,15 @@ class BatchRunner:
         tuple[UNKSpan, ...]
             Uncovered source spans.  Empty tuple means full coverage.
         """
-        # Build source-derived vocabulary from example SOURCE strings.
-        source_vocab: set[str] = set()
-        for ex in examples:
-            for tok in ex.source.split():
-                nfkc = unicodedata.normalize("NFKC", tok)
-                source_vocab.add(nfkc)
+        # Build source-derived vocabulary from example SOURCE strings using the
+        # shared normalizer so units match what ExampleSelector computed.
+        source_vocab: frozenset[str] = frozenset(
+            unit
+            for ex in examples
+            for unit in normalize_source_units(ex.source)
+        )
 
-        return self._unk_detector.detect(source_text, frozenset(source_vocab))
+        return self._unk_detector.detect(source_text, source_vocab)
 
     # ------------------------------------------------------------------
     # Private: failure artifact builder
