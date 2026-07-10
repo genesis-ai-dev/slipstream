@@ -365,17 +365,15 @@ Uses two tiny in-memory temp files (5 verse pairs). No corpus download.
 
 ### 7.6 `GrammarBuilder` (`grammar_builder.py`)
 
-**Inputs:** `attested_vocab: frozenset[str]`, `unk_spans: tuple[UNKSpan, ...]`  
+**Inputs:** `attested_vocab: frozenset[str]`, `item_id: str`  
 **Output:** `str` — an XGrammar grammar string
 
 **Grammar design (BNF/EBNF targeting XGrammar):**
 
 ```
 translation ::= segment+
-segment      ::= attested_token | unk_marker | punctuation | WS
+segment      ::= attested_token | punctuation | WS
 attested_token ::= "word1" | "word2" | ... (one alternative per surface form)
-unk_marker  ::= "[UNK:" unk_surface "]"
-unk_surface ::= "span1" | "span2" | ...  (the pre-identified UNK surface texts)
 punctuation ::= "." | "," | "!" | "?" | ";" | ":" | "'" | "\""
 WS          ::= " "+
 ```
@@ -383,7 +381,7 @@ WS          ::= " "+
 **Rules:**
 
 - Each attested surface token is included **verbatim** after regex-escaping.
-- `[UNK:…]` alternatives are included for each detected `UNKSpan.surface`.
+- `[UNK:…]` is never licensed by the model grammar. Markers are inserted deterministically after generation.
 - Grammar must also allow a sentence-final newline `\n?`.
 - If `attested_vocab` is empty after extraction (degenerate corpus), raise `GrammarBuildError`.
 - Grammar strings must not contain raw subword pieces from the tokenizer vocabulary — only surface-level orthographic tokens.
@@ -391,7 +389,7 @@ WS          ::= " "+
 **Raises:** `GrammarBuildError(item_id, reason)` — never silently falls back.
 
 **Test target:** `tests/constrained_translation/test_grammar_builder.py`  
-Tests include: empty vocab raises, special chars are escaped, UNK markers are present, grammar parses with a dummy XGrammar validator mock.
+Tests include: empty vocab raises, special chars are escaped, UNK markers are absent, grammar parses with a dummy XGrammar validator mock.
 
 ---
 
@@ -429,14 +427,14 @@ Now translate:
 
 ### 7.8 `TokenAuditor` (`token_auditor.py`)
 
-**Inputs:** `token_ids: list[int]`, `attested_vocab: frozenset[str]`, `backend: BackendProtocol`, `unk_spans: tuple[UNKSpan, ...]`  
+**Inputs:** `token_ids: list[int]`, `attested_vocab: frozenset[str]`, `backend: BackendProtocol`  
 **Output:** `TokenAuditResult`
 
 **Algorithm:**
 
 1. For each `token_id` in `token_ids`:
    a. Call `backend.decode_token(token_id)` → `decoded_str`.
-   b. Strip and check if `decoded_str` (after NFKC normalisation) is a substring of or equal to a token in `attested_vocab`, or forms part of a valid `[UNK:…]` marker, or is purely punctuation/whitespace.
+   b. Strip and check if `decoded_str` (after NFKC normalisation) is a substring of or equal to a token in `attested_vocab`, or is explicitly licensed punctuation/whitespace. `[UNK:…]` in model output is always a violation.
    c. If none of the above: record a violation.
 2. Return `TokenAuditResult(passed=len(violations)==0, violations=violations)`.
 
