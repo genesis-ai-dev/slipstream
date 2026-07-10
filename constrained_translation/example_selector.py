@@ -68,6 +68,26 @@ class ExampleSelector:
         # Instantiate query objects once; they load and preprocess the corpus.
         self._bm25 = BM25Query(source_file, target_file, verbose=False)
 
+        # ------------------------------------------------------------------
+        # Precompute immutable per-document unit sets and inverted index.
+        # This is the source-only index used by the coverage stage.
+        # _doc_units[idx] : frozenset[str]  — normalised tokens for row idx
+        # _inverted_index[unit] : list[int] — sorted row indices containing unit
+        # ------------------------------------------------------------------
+        self._doc_units: dict[int, frozenset[str]] = {
+            idx: frozenset(normalize_source_units(self._bm25.source_verses[idx]))
+            for idx in self._bm25.valid_indices
+        }
+
+        _inv: dict[str, list[int]] = {}
+        for idx in self._bm25.valid_indices:
+            for unit in self._doc_units[idx]:
+                _inv.setdefault(unit, []).append(idx)
+        # Sort each postings list so tie-breaking by lowest verse_idx is stable.
+        self._inverted_index: dict[str, list[int]] = {
+            unit: sorted(postings) for unit, postings in _inv.items()
+        }
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -142,6 +162,7 @@ class ExampleSelector:
         query_units: set[str] = set(normalize_source_units(query))
 
         # Subtract units already covered by semantic stage results.
+        # Use precomputed _doc_units to avoid re-normalizing corpus docs.
         covered_units: set[str] = set()
         for ex in semantic_examples:
             covered_units |= (
@@ -157,15 +178,21 @@ class ExampleSelector:
             best_gain: int = 0
             best_score: float = -1.0
 
-            for idx in self._bm25.valid_indices:
+            # Use inverted index to find only candidate rows that overlap with
+            # remaining_units — avoids scanning the full valid_indices list.
+            candidate_indices: set[int] = set()
+            for unit in remaining_units:
+                if unit in self._inverted_index:
+                    candidate_indices.update(self._inverted_index[unit])
+
+            for idx in sorted(candidate_indices):  # sorted for deterministic tie-breaking
                 if idx == exclude_idx:
                     continue
                 if idx in seen_verse_indices:
                     continue
 
-                doc_tokens = set(normalize_source_units(
-                        self._bm25.source_verses[idx]
-                    ))
+                # Reuse cached doc units — no normalize call here.
+                doc_tokens = self._doc_units[idx]
                 gain = len(doc_tokens & remaining_units)
                 if gain == 0:
                     continue
@@ -204,8 +231,8 @@ class ExampleSelector:
                 )
             )
 
-            # Subtract newly covered units.
-            newly_covered = set(normalize_source_units(source)) & remaining_units
+            # Subtract newly covered units using precomputed doc units.
+            newly_covered = self._doc_units[verse_idx] & remaining_units
             remaining_units -= newly_covered
 
         return tuple(semantic_examples + coverage_examples)
