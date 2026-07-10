@@ -328,42 +328,46 @@ class TestFixedEvalIsolation:
 # ---------------------------------------------------------------------------
 
 class TestEquivalenceGrouping:
-    def test_equiv_group_rows_land_in_same_pool(self, small_corpora, tmp_path):
-        """Rows 2 and 20 have the same normalized source — must be in the same pool."""
+    def test_equiv_group_rep_in_some_pool_nonrep_in_remaining(self, small_corpora, tmp_path):
+        """Rows 2 and 20 have the same normalized source.
+        Row 2 is the representative (lowest index): it may go to any pool.
+        Row 20 is the non-representative: it must always be in 'remaining'.
+        No normalized key may cross among seed, acquisition, and fixed_eval.
+        """
         m = _build(small_corpora, tmp_path, seed=42)
-        # Find which pool contains row 2
+        # Row 2 (representative) must appear in exactly one pool
         row2_pool = None
-        row20_pool = None
         for pool_name, pool in [("seed", m.seed), ("acquisition", m.acquisition),
                                  ("fixed_eval", m.fixed_eval), ("remaining", m.remaining)]:
             for item in pool:
                 if item.corpus_idx == 2:
                     row2_pool = pool_name
+        assert row2_pool is not None, "Row 2 (representative) not found in any pool"
+        # Row 20 (non-representative) must always be in 'remaining'
+        row20_pool = None
+        for pool_name, pool in [("seed", m.seed), ("acquisition", m.acquisition),
+                                 ("fixed_eval", m.fixed_eval), ("remaining", m.remaining)]:
+            for item in pool:
                 if item.corpus_idx == 20:
                     row20_pool = pool_name
-        assert row2_pool is not None, "Row 2 not found in any pool"
-        assert row20_pool is not None, "Row 20 not found in any pool"
-        assert row2_pool == row20_pool, (
-            f"Rows 2 and 20 have identical normalized source but landed in "
-            f"different pools ({row2_pool!r} vs {row20_pool!r})"
+        assert row20_pool == "remaining", (
+            f"Row 20 (non-representative equiv of row 2) landed in {row20_pool!r} "
+            f"instead of 'remaining' — non-reps must always be in remaining"
         )
 
-    def test_equiv_group_rows_land_in_same_pool_different_seed(self, small_corpora, tmp_path):
-        """Grouping holds regardless of random seed."""
+    def test_equiv_nonrep_always_in_remaining(self, small_corpora, tmp_path):
+        """Non-representative (row 20) is always in remaining regardless of random seed."""
         for seed in (0, 1, 7, 13, 99):
             m = _build(small_corpora, tmp_path, seed=seed)
-            row2_pool = None
             row20_pool = None
             for pool_name, pool in [("seed", m.seed), ("acquisition", m.acquisition),
                                      ("fixed_eval", m.fixed_eval), ("remaining", m.remaining)]:
                 for item in pool:
-                    if item.corpus_idx == 2:
-                        row2_pool = pool_name
                     if item.corpus_idx == 20:
                         row20_pool = pool_name
-            assert row2_pool == row20_pool, (
-                f"Seed={seed}: rows 2 and 20 in different pools "
-                f"({row2_pool!r} vs {row20_pool!r})"
+            assert row20_pool == "remaining", (
+                f"Seed={seed}: row 20 (non-representative) landed in {row20_pool!r} "
+                f"instead of 'remaining'"
             )
 
 
@@ -655,5 +659,437 @@ class TestRejection:
                 seed_size=10,
                 acq_size=20,
                 eval_size=50,  # 80 total > 26 eligible → should raise
+                random_seed=42,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for experimental-validity issues (Task 1 fix)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def large_equiv_corpora(tmp_path) -> dict:
+    """
+    Corpus with an equivalence group containing 5 members:
+    rows 2, 20, 21, 22, 23 all normalize to the same source key.
+
+    This fixture proves:
+    - len(acquisition) == acq_size (exactly), not acq_size + extra duplicates
+    - at most one acquisition target reference per group (the representative)
+    - duplicate operational rows stay in 'remaining'
+    - no normalized key crosses seed/acquisition/fixed_eval boundaries
+
+    Also includes:
+    - Row 3: 'Go now' (6 chars) as English source
+      - npi target for row 3: 127 × 'x' → len_ratio 127/6 = 21.2 > 20 → excluded
+      This proves placeholder filtering bug is absent: _passes_filters(src, npi_tgt)
+      is called with the REAL 6-char source, not a placeholder.
+    """
+    phrases = [
+        "In the beginning God created the heavens and the earth",
+        "The earth was without form and void and darkness was upon the face",
+        "God said let there be light and there was light in the world",
+        "God saw that the light was good and he divided it from darkness",
+        "God called the light Day and the darkness he called Night",
+        "And there was evening and morning the first day of creation",
+        "God made the firmament to divide the waters above from below",
+        "God created great whales and every living creature that moves",
+        "God blessed them saying be fruitful and multiply and fill the earth",
+        "God saw every thing that he had made and it was very good indeed",
+        "Thus the heavens and the earth were finished in all their host",
+        "On the seventh day God rested from all his work that he had done",
+        "God blessed the seventh day and sanctified it because he rested",
+        "These are the generations of the heavens and of the earth created",
+        "The Lord God formed man of the dust of the ground and breathed life",
+        "The Lord God planted a garden eastward in Eden and there put man",
+        "Out of the ground God made every tree that is pleasant to the sight",
+        "The river went out of Eden to water the garden and from thence",
+        "The Lord God took the man and put him in the garden to dress it",
+        "Of every tree of the garden you may freely eat the fruit thereof",
+    ]
+    eng_lines = [phrases[i % len(phrases)] for i in range(30)]
+    # Five-member equivalence group (rows 2, 20, 21, 22, 23)
+    eng_lines[20] = "God said: let there be light! And there was light, in the world."
+    eng_lines[21] = "GOD SAID, Let there be light. And there was light in the world!"
+    eng_lines[22] = "God said, let there be light - and there was light in the world?"
+    eng_lines[23] = "God said let there be light; and there was light in the world."
+    # Row 3: short source → npi len_ratio violation
+    eng_lines[3] = "Go now"  # 6 chars
+
+    vref_lines = [f"GEN {i + 1}:{i + 1}" for i in range(30)]
+    (tmp_path / "vref.txt").write_text("\n".join(vref_lines) + "\n", encoding="utf-8")
+    (tmp_path / "eng.txt").write_text("\n".join(eng_lines) + "\n", encoding="utf-8")
+
+    tgt_lines: dict[str, list[str]] = {}
+    for lang in LANGUAGES:
+        lines = [
+            f"[{lang}] translation of verse {i} here for completeness and length"
+            for i in range(30)
+        ]
+        if lang == "npi":
+            lines[3] = "x" * 127  # len_ratio 127/6 = 21.2 > 20 → excluded
+        tgt_lines[lang] = lines
+
+    lang_paths: dict[str, Path] = {}
+    for lang in LANGUAGES:
+        p = tmp_path / f"{lang}_large.txt"
+        p.write_text("\n".join(tgt_lines[lang]) + "\n", encoding="utf-8")
+        lang_paths[lang] = p
+
+    return {
+        "eng_path": tmp_path / "eng.txt",
+        "lang_paths": lang_paths,
+        "vref_path": tmp_path / "vref.txt",
+        "eng_lines": eng_lines,
+        "tgt_lines": tgt_lines,
+        "vref_lines": vref_lines,
+        "n_rows": 30,
+    }
+
+
+def _build_large(corpora: dict, *, seed: int = 42,
+                 seed_size: int = 3, acq_size: int = 5,
+                 eval_size: int = 7) -> SequencingManifest:
+    return build_sequencing_manifest(
+        eng_corpus_path=corpora["eng_path"],
+        lang_corpus_paths={lang: corpora["lang_paths"][lang] for lang in LANGUAGES},
+        vref_path=corpora["vref_path"],
+        languages=LANGUAGES,
+        seed_size=seed_size,
+        acq_size=acq_size,
+        eval_size=eval_size,
+        random_seed=seed,
+    )
+
+
+class TestExactCardinality:
+    """len(pool) must equal exactly the requested size for seed, acquisition, fixed_eval."""
+
+    def test_acquisition_exact_acq_size(self, large_equiv_corpora):
+        """len(manifest.acquisition) == acq_size exactly (not acq_size + group overflow)."""
+        for rng_seed in (1, 7, 42, 99):
+            m = _build_large(large_equiv_corpora, seed=rng_seed,
+                             seed_size=3, acq_size=5, eval_size=7)
+            assert len(m.acquisition) == 5, (
+                f"seed={rng_seed}: expected exactly 5 acquisition items, "
+                f"got {len(m.acquisition)} (idxs={sorted(i.corpus_idx for i in m.acquisition)})"
+            )
+
+    def test_seed_exact_seed_size(self, large_equiv_corpora):
+        """len(manifest.seed) == seed_size exactly."""
+        for rng_seed in (1, 7, 42, 99):
+            m = _build_large(large_equiv_corpora, seed=rng_seed,
+                             seed_size=3, acq_size=5, eval_size=7)
+            assert len(m.seed) == 3, (
+                f"seed={rng_seed}: expected exactly 3 seed items, got {len(m.seed)}"
+            )
+
+    def test_fixed_eval_exact_eval_size(self, large_equiv_corpora):
+        """len(manifest.fixed_eval) == eval_size exactly."""
+        for rng_seed in (1, 7, 42, 99):
+            m = _build_large(large_equiv_corpora, seed=rng_seed,
+                             seed_size=3, acq_size=5, eval_size=7)
+            assert len(m.fixed_eval) == 7, (
+                f"seed={rng_seed}: expected exactly 7 fixed_eval items, got {len(m.fixed_eval)}"
+            )
+
+    def test_duplicate_group_cannot_yield_multiple_acquisition_references(self, large_equiv_corpora):
+        """
+        Prove that a 5-member equivalence group never contributes >1 item to acquisition.
+
+        Rows 2, 20, 21, 22, 23 all normalize to the same source key.
+        Only ONE of them (the chosen representative) may appear in acquisition;
+        the other four must remain in 'remaining'.
+        """
+        big_group = {2, 20, 21, 22, 23}
+        for rng_seed in (1, 7, 42, 99, 13):
+            m = _build_large(large_equiv_corpora, seed=rng_seed,
+                             seed_size=3, acq_size=5, eval_size=7)
+            acq_idxs = {item.corpus_idx for item in m.acquisition}
+            overlap = big_group & acq_idxs
+            assert len(overlap) <= 1, (
+                f"seed={rng_seed}: equiv group {big_group} yielded {len(overlap)} "
+                f"acquisition items ({overlap}) — must be at most 1 representative"
+            )
+
+
+class TestNormKeyDisjointAcrossNamedPools:
+    """No normalized source key may appear in more than one named pool (seed/acq/fixed_eval)."""
+
+    def _norm_keys(self, items: list) -> set[str]:
+        from constrained_translation.text_normalize import normalize_source_units
+        return {" ".join(normalize_source_units(item.source_text)) for item in items}
+
+    def test_seed_acq_norm_keys_disjoint(self, large_equiv_corpora):
+        for rng_seed in (1, 7, 42):
+            m = _build_large(large_equiv_corpora, seed=rng_seed)
+            seed_keys = self._norm_keys(m.seed)
+            acq_keys = self._norm_keys(m.acquisition)
+            overlap = seed_keys & acq_keys
+            assert not overlap, (
+                f"seed={rng_seed}: norm keys appear in both seed and acquisition: {overlap}"
+            )
+
+    def test_seed_eval_norm_keys_disjoint(self, large_equiv_corpora):
+        for rng_seed in (1, 7, 42):
+            m = _build_large(large_equiv_corpora, seed=rng_seed)
+            seed_keys = self._norm_keys(m.seed)
+            eval_keys = self._norm_keys(m.fixed_eval)
+            overlap = seed_keys & eval_keys
+            assert not overlap, (
+                f"seed={rng_seed}: norm keys appear in both seed and fixed_eval: {overlap}"
+            )
+
+    def test_acq_eval_norm_keys_disjoint(self, large_equiv_corpora):
+        for rng_seed in (1, 7, 42):
+            m = _build_large(large_equiv_corpora, seed=rng_seed)
+            acq_keys = self._norm_keys(m.acquisition)
+            eval_keys = self._norm_keys(m.fixed_eval)
+            overlap = acq_keys & eval_keys
+            assert not overlap, (
+                f"seed={rng_seed}: norm keys appear in both acquisition and fixed_eval: {overlap}"
+            )
+
+    def test_equiv_duplicates_of_acq_rep_land_in_remaining(self, large_equiv_corpora):
+        """
+        When the representative of the big equiv group {2,20,21,22,23} is placed in
+        acquisition, the other four members must be in 'remaining' (not excluded).
+        """
+        big_group = {2, 20, 21, 22, 23}
+        for rng_seed in (1, 7, 42, 99, 13):
+            m = _build_large(large_equiv_corpora, seed=rng_seed,
+                             seed_size=3, acq_size=5, eval_size=7)
+            acq_idxs = {item.corpus_idx for item in m.acquisition}
+            seed_idxs = {item.corpus_idx for item in m.seed}
+            eval_idxs = {item.corpus_idx for item in m.fixed_eval}
+            rem_idxs = {item.corpus_idx for item in m.remaining}
+            named_idxs = acq_idxs | seed_idxs | eval_idxs
+            named_in_group = big_group & named_idxs
+            assert len(named_in_group) <= 1, (
+                f"seed={rng_seed}: more than one member of big equiv group in named pools"
+            )
+            # Non-representative members must be in remaining
+            non_reps = big_group - named_in_group
+            missing = non_reps - rem_idxs
+            assert not missing, (
+                f"seed={rng_seed}: equiv non-reps {missing} not found in remaining"
+            )
+
+
+class TestRealTargetFiltering:
+    """_passes_filters must be called with real source AND real target (not placeholders)."""
+
+    def test_npi_len_ratio_violation_excluded(self, large_equiv_corpora):
+        """
+        Row 3: eng='Go now' (6 chars), npi='xxx...' (127 chars).
+        ratio = 127/6 = 21.2 > 20 → row 3 must be excluded from ALL pools.
+        With placeholder filtering (bug) the ratio is 127/40 = 3.2 → wrongly included.
+        """
+        m = _build_large(large_equiv_corpora, seed=42, seed_size=2, acq_size=3, eval_size=4)
+        all_idxs = {
+            item.corpus_idx
+            for pool in (m.seed, m.acquisition, m.fixed_eval, m.remaining)
+            for item in pool
+        }
+        assert 3 not in all_idxs, (
+            "Row 3 appeared in a pool despite npi target len_ratio violation "
+            "(placeholder filtering bug: real source must be used)"
+        )
+
+    def test_second_language_corpus_marker_excluded(self, tmp_path):
+        """
+        Prove that a corpus marker in the SECOND target language (not just first)
+        is caught when _passes_filters is called with real source for every language.
+
+        Three-phase bug: the old code checked the target with a placeholder source,
+        which misses len_ratio. Here we use a corpus-marker target to show that
+        even marker detection on non-first languages works correctly.
+        """
+        phrases = [
+            "In the beginning God created the heavens and the earth",
+            "The earth was without form and void and darkness was upon the face",
+            "God said let there be light and there was light in the world",
+            "God saw that the light was good and he divided it from darkness",
+            "God called the light Day and the darkness he called Night",
+            "And there was evening and morning the first day of creation",
+            "God made the firmament to divide the waters above from below",
+            "God created great whales and every living creature that moves",
+            "God blessed them saying be fruitful and multiply and fill the earth",
+            "God saw every thing that he had made and it was very good indeed",
+            "Thus the heavens and the earth were finished in all their host",
+            "On the seventh day God rested from all his work that he had done",
+            "God blessed the seventh day and sanctified it because he rested",
+            "These are the generations of the heavens and of the earth created",
+            "The Lord God formed man of the dust of the ground and breathed life",
+        ]
+        eng_lines = [phrases[i % len(phrases)] for i in range(20)]
+        vref_lines = [f"GEN {i + 1}:{i + 1}" for i in range(20)]
+        (tmp_path / "vref2.txt").write_text("\n".join(vref_lines) + "\n", encoding="utf-8")
+        (tmp_path / "eng2.txt").write_text("\n".join(eng_lines) + "\n", encoding="utf-8")
+        tgt_lines: dict[str, list[str]] = {}
+        for lang in LANGUAGES:
+            lines = [
+                f"[{lang}] verse {i} target text for testing completeness"
+                for i in range(20)
+            ]
+            if lang == "npi":  # second language in LANGUAGES
+                lines[5] = "<range>"  # corpus marker on second language
+            tgt_lines[lang] = lines
+        lang_paths: dict[str, Path] = {}
+        for lang in LANGUAGES:
+            p = tmp_path / f"{lang}_flt.txt"
+            p.write_text("\n".join(tgt_lines[lang]) + "\n", encoding="utf-8")
+            lang_paths[lang] = p
+        m = build_sequencing_manifest(
+            eng_corpus_path=tmp_path / "eng2.txt",
+            lang_corpus_paths=lang_paths,
+            vref_path=tmp_path / "vref2.txt",
+            languages=LANGUAGES,
+            seed_size=1,
+            acq_size=2,
+            eval_size=3,
+            random_seed=42,
+        )
+        all_idxs = {
+            item.corpus_idx
+            for pool in (m.seed, m.acquisition, m.fixed_eval, m.remaining)
+            for item in pool
+        }
+        assert 5 not in all_idxs, (
+            "Row 5 with npi '<range>' target appeared in a pool — "
+            "second-language filter must use real source"
+        )
+
+    def test_third_language_corpus_marker_excluded(self, tmp_path):
+        """Third language (ckb) corpus marker must be caught."""
+        phrases = [
+            "In the beginning God created the heavens and the earth",
+            "The earth was without form and void and darkness was upon the face",
+            "God said let there be light and there was light in the world",
+            "God saw that the light was good and he divided it from darkness",
+            "God called the light Day and the darkness he called Night",
+            "And there was evening and morning the first day of creation",
+            "God made the firmament to divide the waters above from below",
+            "God created great whales and every living creature that moves",
+            "God blessed them saying be fruitful and multiply and fill the earth",
+            "God saw every thing that he had made and it was very good indeed",
+            "Thus the heavens and the earth were finished in all their host",
+            "On the seventh day God rested from all his work that he had done",
+            "God blessed the seventh day and sanctified it because he rested",
+            "These are the generations of the heavens and of the earth created",
+            "The Lord God formed man of the dust of the ground and breathed life",
+        ]
+        eng_lines = [phrases[i % len(phrases)] for i in range(20)]
+        vref_lines = [f"GEN {i + 1}:{i + 1}" for i in range(20)]
+        (tmp_path / "vref3.txt").write_text("\n".join(vref_lines) + "\n", encoding="utf-8")
+        (tmp_path / "eng3.txt").write_text("\n".join(eng_lines) + "\n", encoding="utf-8")
+        tgt_lines = {}
+        for lang in LANGUAGES:
+            lines = [f"[{lang}] verse {i} target text for testing" for i in range(20)]
+            if lang == "ckb":  # third language
+                lines[8] = "<range>"
+            tgt_lines[lang] = lines
+        lang_paths = {}
+        for lang in LANGUAGES:
+            p = tmp_path / f"{lang}_ckb.txt"
+            p.write_text("\n".join(tgt_lines[lang]) + "\n", encoding="utf-8")
+            lang_paths[lang] = p
+        m = build_sequencing_manifest(
+            eng_corpus_path=tmp_path / "eng3.txt",
+            lang_corpus_paths=lang_paths,
+            vref_path=tmp_path / "vref3.txt",
+            languages=LANGUAGES,
+            seed_size=1,
+            acq_size=2,
+            eval_size=3,
+            random_seed=42,
+        )
+        all_idxs = {
+            item.corpus_idx
+            for pool in (m.seed, m.acquisition, m.fixed_eval, m.remaining)
+            for item in pool
+        }
+        assert 8 not in all_idxs, (
+            "Row 8 with ckb '<range>' target appeared in a pool — "
+            "third-language filter must use real source"
+        )
+
+    def test_fourth_language_corpus_marker_excluded(self, tmp_path):
+        """Fourth language (tpi) corpus marker must be caught."""
+        phrases = [
+            "In the beginning God created the heavens and the earth",
+            "The earth was without form and void and darkness was upon the face",
+            "God said let there be light and there was light in the world",
+            "God saw that the light was good and he divided it from darkness",
+            "God called the light Day and the darkness he called Night",
+            "And there was evening and morning the first day of creation",
+            "God made the firmament to divide the waters above from below",
+            "God created great whales and every living creature that moves",
+            "God blessed them saying be fruitful and multiply and fill the earth",
+            "God saw every thing that he had made and it was very good indeed",
+            "Thus the heavens and the earth were finished in all their host",
+            "On the seventh day God rested from all his work that he had done",
+            "God blessed the seventh day and sanctified it because he rested",
+            "These are the generations of the heavens and of the earth created",
+            "The Lord God formed man of the dust of the ground and breathed life",
+        ]
+        eng_lines = [phrases[i % len(phrases)] for i in range(20)]
+        vref_lines = [f"GEN {i + 1}:{i + 1}" for i in range(20)]
+        (tmp_path / "vref4.txt").write_text("\n".join(vref_lines) + "\n", encoding="utf-8")
+        (tmp_path / "eng4.txt").write_text("\n".join(eng_lines) + "\n", encoding="utf-8")
+        tgt_lines = {}
+        for lang in LANGUAGES:
+            lines = [f"[{lang}] verse {i} target text for testing" for i in range(20)]
+            if lang == "tpi":  # fourth language
+                lines[12] = "<range>"
+            tgt_lines[lang] = lines
+        lang_paths = {}
+        for lang in LANGUAGES:
+            p = tmp_path / f"{lang}_tpi.txt"
+            p.write_text("\n".join(tgt_lines[lang]) + "\n", encoding="utf-8")
+            lang_paths[lang] = p
+        m = build_sequencing_manifest(
+            eng_corpus_path=tmp_path / "eng4.txt",
+            lang_corpus_paths=lang_paths,
+            vref_path=tmp_path / "vref4.txt",
+            languages=LANGUAGES,
+            seed_size=1,
+            acq_size=2,
+            eval_size=3,
+            random_seed=42,
+        )
+        all_idxs = {
+            item.corpus_idx
+            for pool in (m.seed, m.acquisition, m.fixed_eval, m.remaining)
+            for item in pool
+        }
+        assert 12 not in all_idxs, (
+            "Row 12 with tpi '<range>' target appeared in a pool — "
+            "fourth-language filter must use real source"
+        )
+
+
+class TestExactCorpusAlignment:
+    """Corpus alignment must require exact equality, not 'at least as long'."""
+
+    def test_longer_lang_corpus_raises_value_error(self, small_corpora, tmp_path):
+        """A language corpus with MORE rows than English must raise ValueError."""
+        longer_npi = tmp_path / "longer_npi.txt"
+        # Write 35 lines for npi (eng has 30)
+        longer_npi.write_text(
+            "\n".join(f"[npi] line {i}" for i in range(35)) + "\n",
+            encoding="utf-8",
+        )
+        bad_paths = dict(small_corpora["lang_paths"])
+        bad_paths["npi"] = longer_npi
+        with pytest.raises(ValueError, match="length|rows|align|mismatch"):
+            build_sequencing_manifest(
+                eng_corpus_path=small_corpora["eng_path"],
+                lang_corpus_paths=bad_paths,
+                vref_path=small_corpora["vref_path"],
+                languages=LANGUAGES,
+                seed_size=3,
+                acq_size=5,
+                eval_size=7,
                 random_seed=42,
             )

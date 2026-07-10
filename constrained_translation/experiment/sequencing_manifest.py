@@ -9,43 +9,47 @@ Behaviour
   **every** language (source AND all targets).  This guarantees the same
   corpus indices are used across mya, npi, ckb, and tpi.
 * Applies normalised-source equivalence grouping: rows whose normalised source
-  text is identical are kept together (placed in the same pool), preventing
-  evaluation leakage through paraphrase equivalents.
+  text is identical are kept together.  One stable representative (lowest
+  corpus index) is chosen per group for the named pools.
 * Partitions eligible equivalence groups into **four disjoint pools** using a
   single deterministic RNG:
     - seed        (default 10)  — initial translated pool; round 0 context
-    - acquisition (default 40)  — sentences selected one-per-round
+    - acquisition (default 40)  — sentences selected one-per-round;
+                                  exactly one representative per group
     - fixed_eval  (default 60)  — held-out evaluation set; never enters any
                                   other pool or the few-shot context
-    - remaining                 — all other eligible rows (the "project")
+    - remaining                 — all other eligible rows (the "project");
+                                  includes non-representative equivalents from
+                                  named-pool groups, never a few-shot pool
+* No normalised key crosses among seed, acquisition, and fixed_eval.
 * Computes and stores a stable SHA-256 digest over pool membership.
 * Serialises/deserialises as JSON for reproducibility.
 
 Structural marker filtering
 ───────────────────────────
-Uses the same ``_passes_filters`` function from
-``constrained_translation.experiment.manifest`` to stay consistent with the
-existing held-out manifest builder.
+Uses ``_passes_filters(src, real_target)`` from
+``constrained_translation.experiment.manifest`` for every requested language,
+with the real source and real target text — not placeholders.
 
 Schema
 ──────
 SequencingPoolItem:
-    corpus_idx   int          0-based corpus line index
-    item_id      str          vref label e.g. "GEN 1:1"
-    source_text  str          English source text
-    target_texts dict[str,str] language → target text
+    corpus_idx   int              0-based corpus line index
+    item_id      str              vref label e.g. "GEN 1:1"
+    source_text  str              English source text
+    target_texts dict[str, str]  language → target text
 
 SequencingManifest:
-    languages    list[str]    ordered list of language codes
-    random_seed  int          RNG seed used
-    seed_size    int          requested seed pool size (groups, not rows)
-    acq_size     int          requested acquisition pool size (groups)
-    eval_size    int          requested fixed-eval pool size (groups)
+    languages    list[str]        ordered list of language codes
+    random_seed  int              RNG seed used
+    seed_size    int              requested seed pool size (representatives)
+    acq_size     int              requested acquisition pool size (representatives)
+    eval_size    int              requested fixed-eval pool size (representatives)
     seed         list[SequencingPoolItem]
     acquisition  list[SequencingPoolItem]
     fixed_eval   list[SequencingPoolItem]
     remaining    list[SequencingPoolItem]
-    digest       str          hex SHA-256 of pool indices
+    digest       str              hex SHA-256 of pool indices
 """
 from __future__ import annotations
 
@@ -54,7 +58,6 @@ import json
 import random
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from constrained_translation.experiment.manifest import _passes_filters
 from constrained_translation.text_normalize import normalize_source_units
@@ -70,22 +73,22 @@ class SequencingPoolItem:
     corpus_idx: int
     item_id: str
     source_text: str
-    target_texts: dict  # lang -> target text
+    target_texts: dict[str, str]
 
 
 @dataclass
 class SequencingManifest:
     """All four disjoint pools plus metadata for one sequencing experiment."""
-    languages: list
+    languages: list[str]
     random_seed: int
     seed_size: int
     acq_size: int
     eval_size: int
-    seed: list  # list[SequencingPoolItem]
-    acquisition: list  # list[SequencingPoolItem]
-    fixed_eval: list  # list[SequencingPoolItem]
-    remaining: list  # list[SequencingPoolItem]
-    digest: str = ""
+    seed: list[SequencingPoolItem]
+    acquisition: list[SequencingPoolItem]
+    fixed_eval: list[SequencingPoolItem]
+    remaining: list[SequencingPoolItem]
+    digest: str = field(default="")
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +119,7 @@ def save_sequencing_manifest(m: SequencingManifest, path: str | Path) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    def _item_to_dict(item: SequencingPoolItem) -> dict:
+    def _item_to_dict(item: SequencingPoolItem) -> dict[str, object]:
         return {
             "corpus_idx": item.corpus_idx,
             "item_id": item.item_id,
@@ -124,7 +127,7 @@ def save_sequencing_manifest(m: SequencingManifest, path: str | Path) -> None:
             "target_texts": item.target_texts,
         }
 
-    data = {
+    data: dict[str, object] = {
         "languages": m.languages,
         "random_seed": m.random_seed,
         "seed_size": m.seed_size,
@@ -143,7 +146,7 @@ def load_sequencing_manifest(path: str | Path) -> SequencingManifest:
     """Deserialise a manifest written by :func:`save_sequencing_manifest`."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
 
-    def _dict_to_item(d: dict) -> SequencingPoolItem:
+    def _dict_to_item(d: dict[str, object]) -> SequencingPoolItem:
         return SequencingPoolItem(
             corpus_idx=d["corpus_idx"],
             item_id=d["item_id"],
@@ -179,15 +182,31 @@ def _norm_key(text: str) -> str:
     return " ".join(units)
 
 
+def _make_item(
+    corpus_idx: int,
+    vrefs: list[str],
+    eng_lines: list[str],
+    lang_lines: dict[str, list[str]],
+    languages: list[str],
+) -> SequencingPoolItem:
+    """Construct one SequencingPoolItem for the given corpus index."""
+    return SequencingPoolItem(
+        corpus_idx=corpus_idx,
+        item_id=vrefs[corpus_idx] if corpus_idx < len(vrefs) else f"IDX:{corpus_idx}",
+        source_text=eng_lines[corpus_idx],
+        target_texts={lang: lang_lines[lang][corpus_idx] for lang in languages},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main builder
 # ---------------------------------------------------------------------------
 
 def build_sequencing_manifest(
     eng_corpus_path: str | Path,
-    lang_corpus_paths: dict,  # dict[str, str | Path]
+    lang_corpus_paths: dict[str, str | Path],
     vref_path: str | Path,
-    languages: list,
+    languages: list[str],
     seed_size: int = 10,
     acq_size: int = 40,
     eval_size: int = 60,
@@ -206,11 +225,11 @@ def build_sequencing_manifest(
     languages:
         Ordered list of language codes to include.
     seed_size:
-        Number of equivalence groups to allocate to the seed pool.
+        Number of equivalence-group representatives to allocate to the seed pool.
     acq_size:
-        Number of equivalence groups to allocate to the acquisition pool.
+        Number of equivalence-group representatives to allocate to the acquisition pool.
     eval_size:
-        Number of equivalence groups to allocate to the fixed-eval pool.
+        Number of equivalence-group representatives to allocate to the fixed-eval pool.
     random_seed:
         Integer seed for deterministic pool assignment.
 
@@ -225,6 +244,15 @@ def build_sequencing_manifest(
     ValueError
         If corpora have mismatched lengths, or if there are insufficient
         eligible rows for the requested pool sizes.
+
+    Notes
+    -----
+    Filtering uses ``_passes_filters(real_src, real_tgt)`` for every language;
+    no placeholder strings are used.  Corpus alignment requires exact equality
+    of row counts across all corpora.  Each named pool (seed, acquisition,
+    fixed_eval) contains exactly one representative per equivalence group;
+    non-representative equivalents of named-pool groups are placed in
+    ``remaining`` so no normalised key crosses named-pool boundaries.
     """
     eng_path = Path(eng_corpus_path)
     vref_p = Path(vref_path)
@@ -238,53 +266,39 @@ def build_sequencing_manifest(
         p = Path(lang_corpus_paths[lang])
         lang_lines[lang] = _load_lines(p)
 
-    # Alignment check: every language corpus must be at least as long as eng
+    # Alignment check: exact equality of row counts required
     n_rows = len(eng_lines)
     for lang in languages:
-        if len(lang_lines[lang]) < n_rows:
+        if len(lang_lines[lang]) != n_rows:
             raise ValueError(
                 f"Language corpus {lang!r} has {len(lang_lines[lang])} rows but "
-                f"English corpus has {n_rows} rows — misalignment detected."
+                f"English corpus has {n_rows} rows — length mismatch detected."
             )
 
-    # Build eligible row set: pass _passes_filters for source AND every target
+    # Build eligible row set: pass _passes_filters(real_src, real_tgt) for ALL languages
     eligible_indices: list[int] = []
     for i in range(min(n_rows, len(vrefs))):
         src = eng_lines[i]
-        # Check source against a dummy target first (corpus marker check)
-        # Use a real target to avoid spurious empty-target rejection
-        src_ok, _ = _passes_filters(src, "placeholder target text for filter check")
-        if not src_ok:
-            continue
-        # Now check each language's target against the (already-validated) source
-        all_tgt_ok = True
+        all_pass = True
         for lang in languages:
             tgt = lang_lines[lang][i]
-            tgt_ok, _ = _passes_filters("placeholder source text for filter check", tgt)
-            if not tgt_ok:
-                all_tgt_ok = False
+            ok, _ = _passes_filters(src, tgt)
+            if not ok:
+                all_pass = False
                 break
-        if not all_tgt_ok:
-            continue
-        # Full joint check: also apply the full filter on the real pair
-        # (catches empty source, too-short, len-ratio, digit-heavy)
-        joint_ok, _ = _passes_filters(src, lang_lines[languages[0]][i])
-        if not joint_ok:
-            continue
-        eligible_indices.append(i)
+        if all_pass:
+            eligible_indices.append(i)
 
-    # Build normalised-source equivalence groups
-    # Each group is a tuple of indices sharing the same normalised source key.
+    # Build normalised-source equivalence groups.
+    # Each group maps a norm key → sorted list of corpus indices.
     norm_to_group: dict[str, list[int]] = {}
     for i in eligible_indices:
         key = _norm_key(eng_lines[i])
         norm_to_group.setdefault(key, []).append(i)
 
-    # Flatten to a list of groups (preserving deterministic order by min index)
-    groups: list[list[int]] = [
-        sorted(idxs) for idxs in norm_to_group.values()
-    ]
-    # Sort groups by their smallest member for determinism
+    # Flatten to a list of groups (preserving deterministic order by min index).
+    # Within each group, indices are sorted; the first (lowest) is the representative.
+    groups: list[list[int]] = [sorted(idxs) for idxs in norm_to_group.values()]
     groups.sort(key=lambda g: g[0])
 
     n_groups = len(groups)
@@ -306,24 +320,48 @@ def build_sequencing_manifest(
     eval_group_indices = group_order[seed_size + acq_size: seed_size + acq_size + eval_size]
     rem_group_indices = group_order[seed_size + acq_size + eval_size:]
 
-    def _groups_to_items(gidxs: list[int]) -> list[SequencingPoolItem]:
-        items = []
-        for gi in gidxs:
-            for corpus_idx in groups[gi]:
-                items.append(SequencingPoolItem(
-                    corpus_idx=corpus_idx,
-                    item_id=vrefs[corpus_idx] if corpus_idx < len(vrefs) else f"IDX:{corpus_idx}",
-                    source_text=eng_lines[corpus_idx],
-                    target_texts={lang: lang_lines[lang][corpus_idx] for lang in languages},
-                ))
-        # Sort by corpus_idx for stable output
-        items.sort(key=lambda it: it.corpus_idx)
-        return items
+    # Named-pool indices: sets of group indices that own a representative slot
+    named_group_set = set(seed_group_indices) | set(acq_group_indices) | set(eval_group_indices)
 
-    seed_items = _groups_to_items(seed_group_indices)
-    acq_items = _groups_to_items(acq_group_indices)
-    eval_items = _groups_to_items(eval_group_indices)
-    rem_items = _groups_to_items(rem_group_indices)
+    def _group_to_rep(gi: int) -> SequencingPoolItem:
+        """Return the representative (lowest corpus index) of group gi."""
+        rep_idx = groups[gi][0]
+        return _make_item(rep_idx, vrefs, eng_lines, lang_lines, languages)
+
+    def _group_non_reps(gi: int) -> list[SequencingPoolItem]:
+        """Return items for all non-representative members of group gi."""
+        return [
+            _make_item(idx, vrefs, eng_lines, lang_lines, languages)
+            for idx in groups[gi][1:]
+        ]
+
+    # Named pools: exactly one representative per group, sorted by corpus_idx
+    seed_items = sorted(
+        [_group_to_rep(gi) for gi in seed_group_indices],
+        key=lambda it: it.corpus_idx,
+    )
+    acq_items = sorted(
+        [_group_to_rep(gi) for gi in acq_group_indices],
+        key=lambda it: it.corpus_idx,
+    )
+    eval_items = sorted(
+        [_group_to_rep(gi) for gi in eval_group_indices],
+        key=lambda it: it.corpus_idx,
+    )
+
+    # Remaining: representatives of non-named groups + non-reps of ALL groups
+    # (so every eligible row appears in exactly one pool)
+    rem_items: list[SequencingPoolItem] = []
+    for gi in rem_group_indices:
+        # All members of remaining groups go to remaining
+        rem_items.extend(
+            _make_item(idx, vrefs, eng_lines, lang_lines, languages)
+            for idx in groups[gi]
+        )
+    for gi in named_group_set:
+        # Non-representative members of named-pool groups also go to remaining
+        rem_items.extend(_group_non_reps(gi))
+    rem_items.sort(key=lambda it: it.corpus_idx)
 
     manifest = SequencingManifest(
         languages=list(languages),

@@ -13,7 +13,8 @@
 ## Frozen definitions
 
 - Shared source indices and normalized-source equivalence groups are used across `mya`, `npi`, `ckb`, and `tpi`.
-- Pools are disjoint after equivalence-group expansion: seed (default 10), acquisition (40), fixed eval (60), and remaining project (all other eligible rows).
+- Pools are equivalence-disjoint by normalized key: seed, acquisition, and fixed_eval each hold **exactly one representative** (lowest corpus index) per equivalence group; no normalized key crosses among these three named pools.  Non-representative rows of named-pool groups remain in `remaining` as operational project cells, and `remaining` is **never** a few-shot pool or fixed-eval source.
+- `len(seed) == seed_size`, `len(acquisition) == acq_size`, `len(fixed_eval) == eval_size` — exact, not "at least".
 - Round 0 is seed-only. Round `r` for 1–40 is measured after acquisition `r` is added.
 - Selection is source-only. Target references are revealed only after a candidate has been selected.
 - Silver maximizes current source support fraction, then BM25 similarity to the translated pool, then stable corpus index.
