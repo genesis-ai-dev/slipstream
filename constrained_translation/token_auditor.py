@@ -92,6 +92,28 @@ _UNK_MARKER_RE = re.compile(r"\[UNK:[^\]]*\]")
 # Word-boundary marker used by SentencePiece (U+2581 LOWER ONE EIGHTH BLOCK)
 _WORD_BOUNDARY = "\u2581"
 
+# ---------------------------------------------------------------------------
+# Qwen terminal control surfaces
+# ---------------------------------------------------------------------------
+#
+# Why the backend terminal ID differs from emitted text
+# -------------------------------------------------------
+# vLLM returns the raw token stream including the model's own end-of-generation
+# control token (im_end / id 248046 for Qwen family).  The model emits it to
+# signal stop; vLLM strips it from GenerationResult.text but keeps it in
+# GenerationResult.token_ids for audit traceability.  It is a *protocol*
+# artefact, never a lexical output of the model.
+#
+# Safety rule
+# -----------
+# Exactly the surface strings listed here are recognised as terminal controls.
+# A terminal control is silently ignored **only** when it is the very last
+# token in the sequence.  At any earlier position it is a loud violation.
+# '<|endoftext|>' is intentionally excluded — add only if tests/config justify.
+QWEN_TERMINAL_CONTROL_SURFACES: frozenset[str] = frozenset({
+    "<|im_end|>",
+})
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -118,6 +140,16 @@ def _is_layout(decoded: str) -> bool:
 def _is_unk_marker(decoded: str) -> bool:
     """Return True if *decoded* contains a [UNK:…] pattern."""
     return bool(_UNK_MARKER_RE.search(decoded))
+
+
+def _is_terminal_control(decoded: str) -> bool:
+    """Return True iff *decoded* is an exact Qwen terminal control surface.
+
+    Only the surfaces explicitly listed in QWEN_TERMINAL_CONTROL_SURFACES are
+    recognised.  Generic angle-bracket strings (e.g. '<person>') are NOT
+    terminal controls.
+    """
+    return decoded in QWEN_TERMINAL_CONTROL_SURFACES
 
 
 def _nfkc(text: str) -> str:
@@ -422,8 +454,59 @@ class TokenAuditor:
         violations: list[str] = []
         seen_provenance: TokenLicense = {}  # provenance for *this* audit call
 
+        # ── Step 1b: Terminal-control pre-pass ──────────────────────────────
+        # Identify whether the *final* token is a Qwen terminal control surface
+        # (e.g. '<|im_end|>').  vLLM appends this protocol token to token_ids
+        # even though it is absent from GenerationResult.text.  It is never a
+        # lexical output of the model.
+        #
+        # Safety rule (strict):
+        #   • Exactly one terminal control is allowed, and only at the very end.
+        #   • A terminal control at any non-final position is a loud violation.
+        #   • A sequence consisting *only* of terminal control(s) fails because
+        #     the grammar must produce lexical output.
+        #
+        # We identify the effective final token and whether it is a terminal
+        # control; then build lexical_token_ids (the token_ids without the
+        # final control, if any) for use in subsequent steps.
+
+        final_ctrl_stripped = False  # True if we removed a final terminal ctrl
+        last_idx = len(token_ids) - 1
+
+        for idx, tid in enumerate(token_ids):
+            decoded = decoded_map[tid]
+            if _is_terminal_control(decoded):
+                if idx == last_idx:
+                    # Final position: this is the only allowed terminal control.
+                    final_ctrl_stripped = True
+                else:
+                    # Non-final position: loud violation.
+                    violations.append(
+                        f"token_id={tid} decoded={decoded!r} is a terminal control "
+                        f"token at non-final position {idx} (must only appear at the "
+                        f"very end of the sequence, if at all)"
+                    )
+
+        # Build the working token list with the final control removed (if any).
+        lexical_token_ids: list[int] = (
+            token_ids[:-1] if final_ctrl_stripped else token_ids
+        )
+
+        # Reject control-only sequences: the grammar must produce lexical output.
+        if final_ctrl_stripped and not lexical_token_ids:
+            violations.append(
+                f"sequence contains only terminal control token(s) with no lexical "
+                f"output; the grammar requires at least one lexical token"
+            )
+            # No point continuing — return early with the violations.
+            passed = len(violations) == 0
+            return TokenAuditResult(
+                passed=passed,
+                violations=violations,
+            ), seen_provenance
+
         # ── Step 2: Per-token checks ─────────────────────────────────────────
-        for tid in token_ids:
+        for tid in lexical_token_ids:
             decoded = decoded_map[tid]
 
             # --- 2a. UNK-marker check (invariant I3) ---
@@ -472,20 +555,21 @@ class TokenAuditor:
         # provenance licence. If any lexical ID is unlicensed, Step 2 already
         # makes the audit fail loudly; skip Step 3 to avoid duplicate/misattributed
         # surface violations while still allowing unlicensed layout IDs.
+        # Note: lexical_token_ids excludes the stripped final terminal control.
         has_unlicensed_lexical_id = any(
             tid not in full_licence and not _is_layout(decoded_map[tid])
-            for tid in token_ids
+            for tid in lexical_token_ids
         )
-        if token_ids and not has_unlicensed_lexical_id:
+        if lexical_token_ids and not has_unlicensed_lexical_id:
             decode_tokens = getattr(backend, "decode_tokens", None)
             if callable(decode_tokens):
                 # Required path for real BPE/byte-level backends.
-                full_surface_text = decode_tokens(token_ids)
+                full_surface_text = decode_tokens(lexical_token_ids)
             else:
                 # Compatibility path for narrow test doubles and legacy custom
                 # backends. SentencePiece markers preserve subword boundaries;
                 # otherwise conservatively treat each decoded piece as a word.
-                pieces = [decoded_map[tid] for tid in token_ids]
+                pieces = [decoded_map[tid] for tid in lexical_token_ids]
                 if any(_WORD_BOUNDARY in piece for piece in pieces):
                     full_surface_text = "".join(pieces).replace(_WORD_BOUNDARY, " ")
                 else:
@@ -507,11 +591,13 @@ class TokenAuditor:
                 )
 
         # ── Step 4: Scalar diagnostics (non-gating) ─────────────────────────
+        # Use lexical_token_ids so the final terminal control does not count
+        # against token_provenance_ratio or surface_attestation_similarity.
         token_provenance_ratio = _compute_token_provenance_ratio(
-            token_ids, decoded_map, full_licence
+            lexical_token_ids, decoded_map, full_licence
         )
         surface_attestation_similarity = _compute_surface_attestation_similarity(
-            token_ids, decoded_map, attested_vocab, backend
+            lexical_token_ids, decoded_map, attested_vocab, backend
         )
 
         passed = len(violations) == 0
