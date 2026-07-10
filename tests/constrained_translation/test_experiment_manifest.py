@@ -337,3 +337,150 @@ class TestLoadManifest:
             assert orig.item_id == loaded_item.item_id
             assert orig.corpus_idx == loaded_item.corpus_idx
             assert orig.exclude_idx == loaded_item.exclude_idx
+
+
+# ---------------------------------------------------------------------------
+# Corpus marker filter tests (Part B)
+# ---------------------------------------------------------------------------
+
+class TestCorpusMarkerFilter:
+    """_passes_filters must reject structural corpus marker strings such as
+    '<range>' on either source or target.  A 'corpus_marker' FilterStats count
+    must be tracked, and the stats JSON must include it.
+    """
+
+    def test_range_marker_on_source_rejected(self):
+        ok, reason = _passes_filters("<range>", "Some valid target sentence here")
+        assert not ok, "<range> source must be rejected"
+        assert reason == "corpus_marker"
+
+    def test_range_marker_on_target_rejected(self):
+        ok, reason = _passes_filters("Some valid source sentence here", "<range>")
+        assert not ok, "<range> target must be rejected"
+        assert reason == "corpus_marker"
+
+    def test_range_marker_case_insensitive(self):
+        ok, reason = _passes_filters("<RANGE>", "Some valid target text here")
+        assert not ok
+        assert reason == "corpus_marker"
+
+    def test_range_marker_with_whitespace_rejected(self):
+        ok, reason = _passes_filters("  <range>  ", "Normal target text here")
+        assert not ok
+        assert reason == "corpus_marker"
+
+    def test_normal_angle_bracket_not_rejected(self):
+        """Generic angle-bracket text that isn't a known marker is NOT rejected."""
+        ok, reason = _passes_filters(
+            "The temple was <ten> cubits wide and very tall",
+            "Normal target text here",
+        )
+        assert ok is True, (
+            "Angle-bracket text that isn't a corpus marker must not be rejected"
+        )
+
+    def test_filter_stats_has_corpus_marker_count(self, small_corpus, tmp_path):
+        """FilterStats and stats JSON must include a corpus_marker count."""
+        from constrained_translation.experiment.manifest import FilterStats
+        import dataclasses
+
+        # FilterStats dataclass must have corpus_marker field
+        field_names = {f.name for f in dataclasses.fields(FilterStats)}
+        assert "corpus_marker" in field_names, (
+            "FilterStats must have a 'corpus_marker' field"
+        )
+
+    def test_stats_json_includes_corpus_marker(self, small_corpus, tmp_path):
+        """stats JSON written by build_manifest must include corpus_marker key."""
+        out = tmp_path / "manifest.jsonl"
+        stats_path = tmp_path / "stats.json"
+
+        import json
+
+        # Write a corpus that includes a <range> marker row
+        marker_eng = small_corpus["eng"] + ["<range>"]
+        marker_tgt = small_corpus["tgt"] + ["<range>"]
+        vref_lines = [f"GEN {i+1}:{i+1}" for i in range(len(marker_eng))]
+
+        new_eng = tmp_path / "eng_m.txt"
+        new_tgt = tmp_path / "tgt_m.txt"
+        new_vref = tmp_path / "vref_m.txt"
+        new_eng.write_text("\n".join(marker_eng) + "\n", encoding="utf-8")
+        new_tgt.write_text("\n".join(marker_tgt) + "\n", encoding="utf-8")
+        new_vref.write_text("\n".join(vref_lines) + "\n", encoding="utf-8")
+
+        build_manifest(
+            eng_corpus_path=new_eng,
+            tgt_corpus_path=new_tgt,
+            vref_path=new_vref,
+            lang="tst", n=5, seed=42,
+            output_path=out,
+            stats_path=stats_path,
+        )
+        stats = json.loads(stats_path.read_text())
+        assert "corpus_marker" in stats, (
+            "stats JSON must include a 'corpus_marker' key"
+        )
+        assert stats["corpus_marker"] >= 1, (
+            "At least one <range> row should have been counted as corpus_marker"
+        )
+
+    def test_corpus_marker_rows_never_enter_manifest(self, tmp_path):
+        """Manifest items must never have '<range>' as source or target."""
+        import json
+
+        src_lines = [
+            "In the beginning God created the heavens and the earth",  # 0
+            "The earth was without form and void darkness",             # 1
+            "<range>",                                                  # 2 — marker
+            "And God said let there be light in darkness",              # 3
+            "And God saw that the light was good and bright",           # 4
+            "God called the light Day and the darkness Night",          # 5
+            "And there was evening and there was morning first day",    # 6
+            "<RANGE>",                                                  # 7 — upper case
+            "God created great whales and every living creature",       # 8
+            "God blessed them saying be fruitful and multiply water",   # 9
+        ]
+        tgt_lines = [
+            "Cible A", "Cible B", "Cible C", "Cible D", "Cible E",
+            "Cible F", "Cible G", "Cible H", "Cible I", "Cible J",
+        ]
+        vref_lines = [f"GEN {i+1}:{i+1}" for i in range(len(src_lines))]
+
+        sp = tmp_path / "src.txt"
+        tp = tmp_path / "tgt.txt"
+        vp = tmp_path / "vref.txt"
+        sp.write_text("\n".join(src_lines) + "\n", encoding="utf-8")
+        tp.write_text("\n".join(tgt_lines) + "\n", encoding="utf-8")
+        vp.write_text("\n".join(vref_lines) + "\n", encoding="utf-8")
+
+        out = tmp_path / "manifest.jsonl"
+        items = build_manifest(
+            eng_corpus_path=sp,
+            tgt_corpus_path=tp,
+            vref_path=vp,
+            lang="tst", n=5, seed=42, output_path=out,
+        )
+        for item in items:
+            assert item.source_text.strip().lower() != "<range>", (
+                f"Manifest item {item.item_id} has a <range> source_text — "
+                "corpus markers must never enter the manifest."
+            )
+            assert item.target_text.strip().lower() != "<range>", (
+                f"Manifest item {item.item_id} has a <range> target_text — "
+                "corpus markers must never enter the manifest."
+            )
+
+    def test_cross_language_prepare_excludes_if_target_has_marker(self, tmp_path):
+        """In shared-language eligibility (prepare path), a row is excluded if
+        any language's target has a corpus marker — so _passes_filters must be
+        called for the target as well and must detect markers there."""
+        ok, reason = _passes_filters(
+            "Some perfectly normal and valid source sentence here",
+            "<range>",
+        )
+        assert not ok, (
+            "_passes_filters must reject a row whose target is a corpus marker; "
+            "the prepare path relies on this to exclude such rows cross-language."
+        )
+        assert reason == "corpus_marker"

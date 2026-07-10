@@ -5,6 +5,7 @@ Builds a leakage-safe held-out manifest from aligned corpora:
 * Reads eng (source) and target language corpora side-by-side.
 * Finds common non-empty aligned rows (both eng and target non-empty).
 * Applies simple anomaly filters and records excluded counts.
+* Rejects structural corpus marker strings (e.g. ``<range>``) on source or target.
 * Deterministically samples *n* rows using *seed* (random.seed).
 * Writes JSONL with fields: item_id, source_text, exclude_idx, plus metadata.
 * Same 0-based corpus indices across languages for paired comparisons.
@@ -43,6 +44,10 @@ _MAX_LEN_RATIO = 20.0
 # Maximum fraction of characters that may be ASCII digits  (verse-number bleed)
 _MAX_DIGIT_FRACTION = 0.5
 
+# Explicit set of structural corpus marker strings (compared case-insensitively
+# after stripping whitespace).  Extend this set when new markers are observed.
+_CORPUS_MARKERS: frozenset[str] = frozenset({"<range>"})
+
 
 @dataclass
 class ManifestItem:
@@ -64,6 +69,7 @@ class FilterStats:
     too_short: int
     len_ratio: int
     digit_heavy: int
+    corpus_marker: int
     eligible: int
     sampled: int
 
@@ -87,8 +93,14 @@ def _digit_fraction(text: str) -> float:
 def _passes_filters(src: str, tgt: str) -> tuple[bool, str]:
     """Return (passes, reason_if_not).
 
-    Applies in order: empty, too_short, len_ratio, digit_heavy.
+    Applies in order: corpus_marker, empty, too_short, len_ratio, digit_heavy.
+
+    Corpus markers (e.g. ``<range>``) are checked first, case-insensitively,
+    on both source and target after stripping whitespace.
     """
+    # Corpus marker check — exact set comparison, case-insensitive
+    if src.strip().lower() in _CORPUS_MARKERS or tgt.strip().lower() in _CORPUS_MARKERS:
+        return False, "corpus_marker"
     if not src.strip():
         return False, "empty_source"
     if not tgt.strip():
@@ -156,6 +168,7 @@ def build_manifest(
         "too_short": 0,
         "len_ratio": 0,
         "digit_heavy": 0,
+        "corpus_marker": 0,
     }
 
     eligible_indices: list[int] = []
@@ -208,6 +221,7 @@ def build_manifest(
         too_short=stats_counts["too_short"],
         len_ratio=stats_counts["len_ratio"],
         digit_heavy=stats_counts["digit_heavy"],
+        corpus_marker=stats_counts["corpus_marker"],
         eligible=len(eligible_indices),
         sampled=len(items),
     )

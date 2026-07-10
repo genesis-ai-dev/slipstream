@@ -468,3 +468,148 @@ class TestExampleSelectorPerCallNOverride:
         r1 = sel.select(query, exclude_idx=0, n_semantic=2, n_coverage=4)
         r2 = sel.select(query, exclude_idx=0, n_semantic=2, n_coverage=4)
         assert r1 == r2, "Results must be deterministic across repeated calls"
+
+
+# ---------------------------------------------------------------------------
+# Equivalence-group source exclusion (duplicate-source leakage prevention)
+# ---------------------------------------------------------------------------
+
+class TestEquivalenceGroupSourceExclusion:
+    """When exclude_idx is given, ALL corpus rows whose normalised source
+    sequence equals the query's normalised source sequence must be excluded
+    from both semantic and coverage stages — not just the single exclude_idx row.
+
+    This prevents leakage when the same English source verse appears at
+    multiple corpus indices (e.g. NUM 7:64 and similar repeated blessing verses).
+
+    If exclude_idx is None, no text-based exclusion should occur.
+    """
+
+    @staticmethod
+    def _make_dup_corpus(tmp_path, duplicate_source: bool):
+        """Build a 6-line corpus.
+
+        Lines 0-4 are unique; line 5 is either a duplicate of line 0 (same
+        normalised source but a *different* target) or a fresh distinct verse.
+
+        Returns (src_path, tgt_path, query_text) where query_text normalises
+        identically to lines 0 and (optionally) 5.
+        """
+        # Row 0 and row 5 will share the *same* normalised source if duplicate=True
+        shared_src = "God created the heavens and the earth"
+        if duplicate_source:
+            src_lines = [
+                shared_src,                              # 0 — held-out query row
+                "The earth was without form and void",   # 1
+                "And God said let there be light",       # 2
+                "And God saw that the light was good",   # 3
+                "God called the light Day and Night",    # 4
+                shared_src,                              # 5 — DUPLICATE source, DIFFERENT target
+            ]
+            tgt_lines = [
+                "Cible A",                               # 0
+                "Cible B",                               # 1
+                "Cible C",                               # 2
+                "Cible D",                               # 3
+                "Cible E",                               # 4
+                "Cible F",                               # 5 — different target
+            ]
+        else:
+            src_lines = [
+                shared_src,                              # 0
+                "The earth was without form and void",   # 1
+                "And God said let there be light",       # 2
+                "And God saw that the light was good",   # 3
+                "God called the light Day and Night",    # 4
+                "And God blessed the seventh day",       # 5 — UNIQUE source
+            ]
+            tgt_lines = [
+                "Cible A",
+                "Cible B",
+                "Cible C",
+                "Cible D",
+                "Cible E",
+                "Cible F",
+            ]
+        src_path = tmp_path / "src.txt"
+        tgt_path = tmp_path / "tgt.txt"
+        src_path.write_text("\n".join(src_lines) + "\n", encoding="utf-8")
+        tgt_path.write_text("\n".join(tgt_lines) + "\n", encoding="utf-8")
+        return str(src_path), str(tgt_path), shared_src
+
+    def test_semantic_excludes_duplicate_source_row(self, tmp_path):
+        """Semantic stage must not return a row with identical normalised source
+        as the held-out exclude_idx row."""
+        src, tgt, query = self._make_dup_corpus(tmp_path, duplicate_source=True)
+        sel = _make_selector(src, tgt, n_semantic=5, n_coverage=0)
+        results = sel.select(query, exclude_idx=0)
+        # Row 5 has the same normalised source as row 0 (the exclude_idx row).
+        # It must NOT appear in results.
+        verse_indices = [ex.verse_idx for ex in results]
+        assert 0 not in verse_indices, "exclude_idx=0 must be excluded"
+        assert 5 not in verse_indices, (
+            "Row 5 shares identical normalised source with exclude_idx=0 "
+            "and must also be excluded from semantic stage (equivalence-group exclusion)."
+        )
+
+    def test_coverage_excludes_duplicate_source_row(self, tmp_path):
+        """Coverage stage must not return a row with identical normalised source
+        as the held-out exclude_idx row."""
+        src, tgt, query = self._make_dup_corpus(tmp_path, duplicate_source=True)
+        sel = _make_selector(src, tgt, n_semantic=0, n_coverage=5)
+        results = sel.select(query, exclude_idx=0)
+        verse_indices = [ex.verse_idx for ex in results]
+        assert 0 not in verse_indices, "exclude_idx=0 must be excluded"
+        assert 5 not in verse_indices, (
+            "Row 5 shares identical normalised source with exclude_idx=0 "
+            "and must also be excluded from coverage stage (equivalence-group exclusion)."
+        )
+
+    def test_nonduplicate_row_not_excluded(self, tmp_path):
+        """A non-duplicate row (row 5 unique source) must NOT be wrongly excluded."""
+        src, tgt, query = self._make_dup_corpus(tmp_path, duplicate_source=False)
+        sel = _make_selector(src, tgt, n_semantic=5, n_coverage=5)
+        results = sel.select(query, exclude_idx=0)
+        verse_indices = [ex.verse_idx for ex in results]
+        # Row 5 has a different normalised source; must be eligible
+        # (it may or may not be returned depending on BM25 score, but it
+        # must not be systematically excluded — so we check it is in the
+        # eligible pool by asking the selector for enough results).
+        assert 0 not in verse_indices, "exclude_idx=0 must still be excluded"
+        # Row 5 (distinct source) should be selectable — if enough slots requested.
+        # The corpus has 6 rows; with exclude_idx=0 there are 5 candidates.
+        # We asked for 5+5=10, which exhausts all candidates, so 5 must appear.
+        assert 5 in verse_indices, (
+            "Row 5 has a DIFFERENT normalised source from exclude_idx=0 and "
+            "must NOT be excluded by the equivalence-group mechanism."
+        )
+
+    def test_exclude_idx_none_does_not_text_exclude(self, tmp_path):
+        """When exclude_idx=None, no text-based exclusion occurs.
+        Both row 0 and row 5 (identical sources) must be eligible."""
+        src, tgt, query = self._make_dup_corpus(tmp_path, duplicate_source=True)
+        sel = _make_selector(src, tgt, n_semantic=6, n_coverage=0)
+        results = sel.select(query, exclude_idx=None)
+        verse_indices = {ex.verse_idx for ex in results}
+        # With no exclude, all 6 rows are candidates; both 0 and 5 share the
+        # highest BM25 score so at least one should appear.
+        assert (0 in verse_indices) or (5 in verse_indices), (
+            "With exclude_idx=None, duplicate-source rows 0 and 5 must not be "
+            "blanket-excluded — at least one must appear in results."
+        )
+
+    def test_semantic_requests_extra_candidates_to_fill_count(self, tmp_path):
+        """After filtering equivalents, semantic stage must still return
+        up to n_semantic results from non-equivalent candidates (i.e. it
+        must fetch enough BM25 candidates internally before filtering)."""
+        src, tgt, query = self._make_dup_corpus(tmp_path, duplicate_source=True)
+        # Corpus: 6 rows total; row 0 excluded by index, row 5 excluded by
+        # equivalence — leaves 4 eligible candidates.
+        # Asking for n_semantic=4 must fill all 4 slots, not stop at n_semantic-1.
+        sel = _make_selector(src, tgt, n_semantic=4, n_coverage=0)
+        results = sel.select(query, exclude_idx=0)
+        sem_results = [ex for ex in results if ex.selection_method == "semantic"]
+        assert len(sem_results) == 4, (
+            f"Expected 4 semantic results after excluding 2 equivalent rows, "
+            f"got {len(sem_results)}. Semantic stage must over-fetch then filter."
+        )

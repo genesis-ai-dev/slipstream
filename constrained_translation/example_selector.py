@@ -19,9 +19,17 @@ De-duplication:
     coverage entry is discarded (per plan §7.3).
 
 Held-out exclusion:
-    exclude_idx is the 0-based verse index of the query verse itself.  It is
-    excluded from BOTH stages by its stable integer index — never by text
-    matching (invariant §2, task 3 spec).
+    When exclude_idx is supplied, every valid corpus row whose normalised
+    source-unit SEQUENCE equals the query's normalised source-unit sequence is
+    excluded from BOTH stages (equivalence-group source exclusion).  This
+    prevents leakage when the same English source verse appears at multiple
+    corpus indices (e.g. NUM 7:64 and identical repeated blessing verses).
+    The exact exclude_idx is also always excluded regardless of text.
+
+    If exclude_idx is None, no text-based exclusion occurs — all rows are
+    eligible (current behaviour preserved).
+
+    Target text is NEVER used for exclusion decisions.
 
 Evidence tier:
     All returned AlignedExample objects carry evidence_tier=1
@@ -79,6 +87,15 @@ class ExampleSelector:
             for idx in self._bm25.valid_indices
         }
 
+        # Precompute normalised source sequence (tuple) per valid index for
+        # equivalence-group detection.  Sequence equality (not set equality)
+        # ensures we only exclude truly identical source text, not merely
+        # overlapping vocabulary.
+        self._doc_norm_seq: dict[int, tuple[str, ...]] = {
+            idx: tuple(normalize_source_units(self._bm25.source_verses[idx]))
+            for idx in self._bm25.valid_indices
+        }
+
         _inv: dict[str, list[int]] = {}
         for idx in self._bm25.valid_indices:
             for unit in self._doc_units[idx]:
@@ -106,9 +123,11 @@ class ExampleSelector:
         query:
             Source-language text to find examples for.
         exclude_idx:
-            0-based corpus index of the held-out / query verse.  This verse is
-            excluded from results by its stable integer index (not by text
-            match).  Pass None to include all verses.
+            0-based corpus index of the held-out / query verse.  When supplied,
+            this verse and ALL corpus rows with an identical normalised source
+            sequence are excluded from both stages (equivalence-group source
+            exclusion).  Target text is never used for exclusion.
+            Pass None to include all verses (no text-based exclusion).
         n_semantic:
             Override the number of semantic (BM25) candidates for this call.
             Defaults to the value passed at construction time.
@@ -122,24 +141,50 @@ class ExampleSelector:
             Semantic results first, then non-duplicate coverage results.
             All entries have evidence_tier=1.
         """
-        exclude: int = exclude_idx if exclude_idx is not None else -1
         _n_semantic = n_semantic if n_semantic is not None else self._n_semantic
         _n_coverage = n_coverage if n_coverage is not None else self._n_coverage
+
+        # ------------------------------------------------------------------
+        # Compute equivalence-group exclusion set (source-sequence based).
+        # Only active when exclude_idx is not None.
+        # ------------------------------------------------------------------
+        equiv_excluded: set[int] = set()
+        if exclude_idx is not None:
+            # Normalised source sequence of the held-out query verse.
+            query_norm_seq = tuple(normalize_source_units(query))
+            for idx in self._bm25.valid_indices:
+                if self._doc_norm_seq[idx] == query_norm_seq:
+                    equiv_excluded.add(idx)
+            # Always exclude exclude_idx itself (even if text differs — stable
+            # index contract).
+            equiv_excluded.add(exclude_idx)
+
+        def _is_excluded(idx: int) -> bool:
+            if exclude_idx is None:
+                return False
+            return idx in equiv_excluded
 
         # ----------------------------------------------------------------
         # Stage 1 — semantic retrieval via BM25
         # ----------------------------------------------------------------
-        # BM25Query._simple_search returns List[Tuple[1-based_idx, src, tgt, score]]
+        # We may need to over-fetch to get enough results after filtering
+        # the equivalence group.  Request all valid_indices worth of
+        # candidates at most; filter down to _n_semantic after.
+        n_total = len(self._bm25.valid_indices)
+        fetch_k = min(n_total, _n_semantic + len(equiv_excluded) + 1)
+
         raw_semantic = self._bm25._simple_search(
-            query, top_k=_n_semantic, exclude_idx=exclude
+            query, top_k=fetch_k, exclude_idx=(exclude_idx if exclude_idx is not None else -1)
         )
 
         semantic_examples: list[AlignedExample] = []
         seen_verse_indices: set[int] = set()
 
         for one_based_idx, source, target, score in raw_semantic:
+            if len(semantic_examples) >= _n_semantic:
+                break
             verse_idx = one_based_idx - 1  # convert to 0-based
-            if verse_idx == exclude_idx:
+            if _is_excluded(verse_idx):
                 continue
             if verse_idx in seen_verse_indices:
                 continue
@@ -186,7 +231,7 @@ class ExampleSelector:
                     candidate_indices.update(self._inverted_index[unit])
 
             for idx in sorted(candidate_indices):  # sorted for deterministic tie-breaking
-                if idx == exclude_idx:
+                if _is_excluded(idx):
                     continue
                 if idx in seen_verse_indices:
                     continue
