@@ -366,6 +366,123 @@ def test_grammar_builder_normal_unicode_not_rejected():
 
 
 # ---------------------------------------------------------------------------
+# Zero-width character allowlist tests — Task: allow U+200B/C/D in Cf
+# ---------------------------------------------------------------------------
+
+def test_grammar_builder_allows_zero_width_space():
+    """U+200B ZERO WIDTH SPACE (Cf) must be accepted — essential in Burmese corpora."""
+    m = _import_builder()
+    # Burmese word-boundary token containing ZWS
+    tok = "ကြည့်\u200bရှု"  # zero-width space between syllables
+    vocab = frozenset([tok])
+    grammar = m.GrammarBuilder().build(vocab, item_id="MYA 1:1")
+    assert isinstance(grammar, str)
+    assert len(grammar) > 0
+
+
+def test_grammar_builder_allows_zero_width_non_joiner():
+    """U+200C ZERO WIDTH NON-JOINER (Cf) must be accepted — Indic/Devanagari scripts."""
+    m = _import_builder()
+    tok = "प्र\u200cकार"  # ZWNJ used to prevent ligature in Devanagari
+    vocab = frozenset([tok])
+    grammar = m.GrammarBuilder().build(vocab, item_id="NPI 1:1")
+    assert isinstance(grammar, str)
+    assert len(grammar) > 0
+
+
+def test_grammar_builder_allows_zero_width_joiner():
+    """U+200D ZERO WIDTH JOINER (Cf) must be accepted — essential in Nepali corpora."""
+    m = _import_builder()
+    # Nepali conjunct consonant token containing ZWJ
+    tok = "क्\u200dष"  # ZWJ between consonants to form a conjunct
+    vocab = frozenset([tok])
+    grammar = m.GrammarBuilder().build(vocab, item_id="NPI 1:2")
+    assert isinstance(grammar, str)
+    assert len(grammar) > 0
+
+
+def test_grammar_builder_allows_burmese_realistic_token():
+    """Realistic Burmese token with U+200B must be accepted and appear in grammar."""
+    m = _import_builder()
+    # Burmese: 'လေ့လာ' + ZWS + 'ရန်'  (commonly tokenised together in mya Bible text)
+    tok = "လေ့လာ\u200bရန်"
+    vocab = frozenset([tok, "သည်", "ကို"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="MYA 2:1")
+    assert isinstance(grammar, str)
+    # The Burmese chars should appear in the grammar
+    assert "လေ့လာ" in grammar
+
+
+def test_grammar_builder_allows_nepali_realistic_token():
+    """Realistic Nepali token with U+200D must be accepted and appear in grammar."""
+    m = _import_builder()
+    # Nepali: conjunct with ZWJ
+    tok = "ज्\u200dञ"
+    vocab = frozenset([tok, "को", "मा"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="NPI 2:1")
+    assert isinstance(grammar, str)
+    assert "ज्" in grammar
+
+
+def test_grammar_builder_still_rejects_right_to_left_override():
+    """U+202E RIGHT-TO-LEFT OVERRIDE (Cf) must still be rejected — bidi attack vector."""
+    m = _import_builder()
+    vocab = frozenset(["word\u202eevil"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 1:1")
+    assert exc_info.value.item_id == "BIDI 1:1"
+    assert "202E" in exc_info.value.reason.upper() or "Cf" in exc_info.value.reason
+
+
+def test_grammar_builder_still_rejects_right_to_left_embedding():
+    """U+202B RIGHT-TO-LEFT EMBEDDING (Cf) must still be rejected."""
+    m = _import_builder()
+    vocab = frozenset(["word\u202b"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 1:2")
+    assert exc_info.value.item_id == "BIDI 1:2"
+    assert "Cf" in exc_info.value.reason
+
+
+def test_grammar_builder_still_rejects_left_to_right_override():
+    """U+202D LEFT-TO-RIGHT OVERRIDE (Cf) must still be rejected."""
+    m = _import_builder()
+    vocab = frozenset(["\u202dhello"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="BIDI 1:3")
+    assert exc_info.value.item_id == "BIDI 1:3"
+
+
+def test_grammar_builder_still_rejects_soft_hyphen():
+    """U+00AD SOFT HYPHEN (Cf) must still be rejected — non-printing, confusable."""
+    m = _import_builder()
+    vocab = frozenset(["word\u00adbreak"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="CF 1:1")
+    assert exc_info.value.item_id == "CF 1:1"
+
+
+def test_grammar_builder_still_rejects_word_joiner():
+    """U+2060 WORD JOINER (Cf) must still be rejected — not in the explicit allowlist."""
+    m = _import_builder()
+    vocab = frozenset(["word\u2060join"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="CF 1:2")
+    assert exc_info.value.item_id == "CF 1:2"
+
+
+def test_grammar_builder_cf_allowlist_does_not_weaken_cc_rejection():
+    """The Cf allowlist must not accidentally permit Cc (real control chars)."""
+    m = _import_builder()
+    # U+0001 START OF HEADING (Cc) — must still be rejected
+    vocab = frozenset(["bad\x01token"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="CC 1:1")
+    assert exc_info.value.item_id == "CC 1:1"
+    assert "Cc" in exc_info.value.reason
+
+
+# ---------------------------------------------------------------------------
 # xgrammar compile test using vllm-env interpreter (non-skipped when available)
 # ---------------------------------------------------------------------------
 
@@ -438,9 +555,91 @@ else:
         pytest.skip(f"xgrammar not importable in vllm-env: {stdout}")
 
     assert result.returncode == 0, (
-        f"vllm-env xgrammar compile failed (rc={result.returncode}):\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        f"vllm-env xgrammar compile failed (rc={result.returncode}):\\n"
+        f"stdout: {result.stdout}\\nstderr: {result.stderr}"
     )
     assert stdout == "OK", (
         f"vllm-env xgrammar compile reported failure: {stdout}"
+    )
+
+
+@pytest.mark.skipif(
+    not __import__("os").path.exists("/home/clear/vllm-env/bin/python"),
+    reason="/home/clear/vllm-env/bin/python not found — skipping Burmese/Nepali xgrammar compile test",
+)
+def test_grammar_compiles_with_vllm_env_xgrammar_burmese_nepali():
+    """Compile grammar with Burmese (U+200B) and Nepali (U+200D) tokens via vllm-env xgrammar."""
+    import subprocess
+
+    vllm_python = "/home/clear/vllm-env/bin/python"
+
+    m = _import_builder()
+    # Realistic Burmese tokens with ZERO WIDTH SPACE (U+200B)
+    # Realistic Nepali tokens with ZERO WIDTH JOINER (U+200D)
+    vocab = frozenset([
+        "လေ့လာ\u200bရန်",   # Burmese + ZWS
+        "ကြည့်\u200bရှု",    # Burmese + ZWS
+        "သည်",               # plain Burmese
+        "ज्\u200dञ",          # Nepali + ZWJ
+        "क्\u200dष",          # Nepali + ZWJ
+        "को",                 # plain Nepali
+        "प्र\u200cकार",       # Devanagari + ZWNJ
+    ])
+    grammar_str = m.GrammarBuilder().build(vocab, item_id="MYA-NPI 1:1")
+
+    grammar_repr = repr(grammar_str)
+
+    script = f"""
+import sys
+try:
+    import xgrammar
+except ImportError:
+    print("SKIP:xgrammar_not_importable")
+    sys.exit(0)
+
+grammar_str = {grammar_repr}
+
+compiled = False
+errors = []
+for attr in ["Grammar", "BNFGrammar", "GrammarCompiler"]:
+    cls = getattr(xgrammar, attr, None)
+    if cls is None:
+        continue
+    for method in ["from_ebnf_string", "from_ebnf", "from_string"]:
+        fn = getattr(cls, method, None)
+        if fn is None:
+            continue
+        try:
+            fn(grammar_str)
+            compiled = True
+            break
+        except Exception as e:
+            errors.append(f"{{attr}}.{{method}}: {{e}}")
+    if compiled:
+        break
+
+if compiled:
+    print("OK")
+else:
+    print("FAIL:" + "; ".join(errors))
+    sys.exit(1)
+"""
+
+    result = subprocess.run(
+        [vllm_python, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    stdout = result.stdout.strip()
+    if stdout.startswith("SKIP:"):
+        pytest.skip(f"xgrammar not importable in vllm-env: {stdout}")
+
+    assert result.returncode == 0, (
+        f"vllm-env xgrammar Burmese/Nepali compile failed (rc={result.returncode}):\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert stdout == "OK", (
+        f"vllm-env xgrammar Burmese/Nepali compile reported failure: {stdout}"
     )

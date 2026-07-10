@@ -150,11 +150,24 @@ class GrammarBuilder:
         # characters (categories Cc, Cf, Cs, Co, Cn).  These characters have no
         # legitimate place inside a surface token and would silently corrupt the
         # grammar or the generated output.
+        #
+        # Narrow allowlist for Cf: zero-width joining/spacing characters that are
+        # linguistically essential in real corpora and are NOT security-sensitive:
+        #   U+200B  ZERO WIDTH SPACE          — Burmese (mya) word-boundary marker
+        #   U+200C  ZERO WIDTH NON-JOINER     — Devanagari / Indic scripts
+        #   U+200D  ZERO WIDTH JOINER         — Nepali (npi) conjunct consonants
+        # All other Cf characters (bidi overrides, soft-hyphen, language tags, …)
+        # remain forbidden.
+        _CF_ALLOWLIST: frozenset[str] = frozenset({
+            "\u200B",  # ZERO WIDTH SPACE
+            "\u200C",  # ZERO WIDTH NON-JOINER
+            "\u200D",  # ZERO WIDTH JOINER
+        })
         _FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
         for tok in attested_vocab:
             for ch in tok:
                 cat = unicodedata.category(ch)
-                if cat in _FORBIDDEN_CATEGORIES:
+                if cat in _FORBIDDEN_CATEGORIES and ch not in _CF_ALLOWLIST:
                     raise GrammarBuildError(
                         item_id=item_id,
                         reason=(
