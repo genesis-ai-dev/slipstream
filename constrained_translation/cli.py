@@ -144,6 +144,23 @@ def _parse_input_jsonl(path: str) -> list[BatchItem]:
                 f"Line {lineno}: missing required field(s): {', '.join(missing)}"
             )
 
+        # Validate exclude_idx type: must be a JSON integer or null.
+        # Explicitly reject bool, float, string — these would silently
+        # corrupt the held-out logic.
+        raw_excl = record["exclude_idx"]
+        if raw_excl is not None:
+            # JSON booleans deserialize as Python bool (subclass of int) — reject them.
+            if isinstance(raw_excl, bool):
+                raise ValueError(
+                    f"Line {lineno}: exclude_idx must be an integer or null, "
+                    f"got bool ({raw_excl!r})"
+                )
+            if not isinstance(raw_excl, int):
+                raise ValueError(
+                    f"Line {lineno}: exclude_idx must be an integer or null, "
+                    f"got {type(raw_excl).__name__} ({raw_excl!r})"
+                )
+
         items.append(
             BatchItem(
                 item_id=str(record["item_id"]),

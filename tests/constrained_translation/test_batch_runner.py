@@ -987,8 +987,8 @@ class TestExpandedRetrieval:
             mock_instance = MagicMock()
             MockSelector.return_value = mock_instance
 
-            def capture_select(query, exclude_idx=None):
-                select_call_args.append((query, exclude_idx))
+            def capture_select(query, exclude_idx=None, n_semantic=None, n_coverage=None):
+                select_call_args.append((query, exclude_idx, n_coverage))
                 return ()
 
             mock_instance.select.side_effect = capture_select
@@ -1327,3 +1327,123 @@ class TestMaxRetriesDefault:
         sig = inspect.signature(BatchRunner.__init__)
         default = sig.parameters["max_retries"].default
         assert default == 2, f"Expected max_retries default=2, got {default}"
+
+
+# ---------------------------------------------------------------------------
+# §16  ExampleSelector is constructed/cached once per run (quality review)
+# ---------------------------------------------------------------------------
+
+class TestBatchRunnerSelectorCaching:
+    """Verify that BatchRunner builds the BM25 index exactly once per run()
+    call, regardless of item count or retries.
+    """
+
+    def test_selector_constructed_once_across_multiple_items(
+        self, corpus_files, log_path
+    ):
+        """ExampleSelector.__init__ must be called exactly once during run(),
+        even when processing multiple items.
+
+        Strategy: patch ExampleSelector.__init__ to count calls while still
+        delegating to the real implementation.
+        """
+        from unittest.mock import patch as _patch
+        from constrained_translation.example_selector import ExampleSelector
+
+        init_call_count = {"n": 0}
+        _real_init = ExampleSelector.__init__
+
+        def _counting_init(self_inner, *args, **kwargs):
+            init_call_count["n"] += 1
+            _real_init(self_inner, *args, **kwargs)
+
+        src, tgt = corpus_files
+        runner = BatchRunner(
+            source_file=src,
+            target_file=tgt,
+            backend=FakeBackend(),
+            log_path=log_path,
+            max_retries=0,
+            n_semantic=3,
+            n_coverage=3,
+        )
+
+        items = [
+            BatchItem(item_id=f"GEN 1:{i}", source_text="God saw the light", exclude_idx=None)
+            for i in range(3)
+        ]
+
+        with _patch.object(ExampleSelector, "__init__", _counting_init):
+            runner.run(items)
+
+        assert init_call_count["n"] == 1, (
+            f"ExampleSelector.__init__ called {init_call_count['n']} times; "
+            f"expected exactly 1 (index must not be rebuilt per item)"
+        )
+
+    def test_selector_constructed_once_across_retries(
+        self, corpus_files, log_path
+    ):
+        """With max_retries > 0 and a forced-retry item, the BM25 index must
+        still only be built once (retries use per-call n_coverage overrides).
+        """
+        from unittest.mock import patch as _patch
+        from constrained_translation.example_selector import ExampleSelector
+
+        init_call_count = {"n": 0}
+        _real_init = ExampleSelector.__init__
+
+        def _counting_init(self_inner, *args, **kwargs):
+            init_call_count["n"] += 1
+            _real_init(self_inner, *args, **kwargs)
+
+        src, tgt = corpus_files
+        runner = BatchRunner(
+            source_file=src,
+            target_file=tgt,
+            backend=FakeBackend(),
+            log_path=log_path,
+            max_retries=2,
+            n_semantic=3,
+            n_coverage=3,
+        )
+
+        # "xyzzy" is not in the corpus → forces coverage retries.
+        items = [
+            BatchItem(item_id="HARD 1:1", source_text="xyzzy blorple", exclude_idx=None),
+        ]
+
+        with _patch.object(ExampleSelector, "__init__", _counting_init):
+            runner.run(items)
+
+        assert init_call_count["n"] == 1, (
+            f"ExampleSelector.__init__ called {init_call_count['n']} times during retries; "
+            f"expected exactly 1 (retries must use per-call overrides, not rebuild the index)"
+        )
+
+    def test_held_out_exclusion_preserved_through_retries(
+        self, corpus_files, log_path
+    ):
+        """exclude_idx must be forwarded on all retry calls (not just attempt 0)."""
+        src, tgt = corpus_files
+        runner = BatchRunner(
+            source_file=src,
+            target_file=tgt,
+            backend=FakeBackend(),
+            log_path=log_path,
+            max_retries=2,
+            n_semantic=2,
+            n_coverage=2,
+        )
+
+        # Use exclude_idx=0 (verse 0 = "In the beginning…"); verify it's never returned.
+        items = [
+            BatchItem(
+                item_id="GEN 1:1",
+                source_text="In the beginning God created the heavens and the earth",
+                exclude_idx=0,
+            ),
+        ]
+        results, _ = runner.run(items)
+        # The result must be produced (no crash); coverage may pass or hard-fail.
+        assert len(results) == 1

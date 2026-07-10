@@ -297,3 +297,150 @@ def test_grammar_compiles_with_xgrammar():
         f"xgrammar failed to compile grammar.\nErrors:\n" + "\n".join(errors) +
         f"\n\nGrammar:\n{grammar_str}"
     )
+
+
+# ---------------------------------------------------------------------------
+# test_grammar_builder_rejects_control_characters — new tests (quality review)
+# ---------------------------------------------------------------------------
+
+def test_grammar_builder_rejects_nul_character():
+    """A token containing NUL (U+0000, Cc) must raise GrammarBuildError."""
+    m = _import_builder()
+    vocab = frozenset(["hello\x00world"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="CTRL 1:1")
+    assert exc_info.value.item_id == "CTRL 1:1"
+    assert "0000" in exc_info.value.reason or "Cc" in exc_info.value.reason
+
+
+def test_grammar_builder_rejects_tab_character():
+    """A token containing TAB (U+0009, Cc) must raise GrammarBuildError."""
+    m = _import_builder()
+    vocab = frozenset(["word\t"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="CTRL 1:2")
+    assert exc_info.value.item_id == "CTRL 1:2"
+
+
+def test_grammar_builder_rejects_carriage_return():
+    """A token containing CR (U+000D, Cc) must raise GrammarBuildError."""
+    m = _import_builder()
+    vocab = frozenset(["word\r"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="CTRL 1:3")
+    assert exc_info.value.item_id == "CTRL 1:3"
+
+
+def test_grammar_builder_rejects_bidi_control():
+    """A token containing a BiDi control character (U+200F, Cf) must raise GrammarBuildError."""
+    m = _import_builder()
+    # U+200F RIGHT-TO-LEFT MARK (category Cf)
+    vocab = frozenset(["word\u200f"])
+    with pytest.raises(m.GrammarBuildError) as exc_info:
+        m.GrammarBuilder().build(vocab, item_id="CTRL 1:4")
+    assert exc_info.value.item_id == "CTRL 1:4"
+    # Must mention the character codepoint or Cf category
+    assert "200F" in exc_info.value.reason.upper() or "Cf" in exc_info.value.reason
+
+
+def test_grammar_builder_control_char_error_carries_item_id():
+    """GrammarBuildError raised for a control character must carry item_id."""
+    m = _import_builder()
+    vocab = frozenset(["bad\x00token"])
+    try:
+        m.GrammarBuilder().build(vocab, item_id="MYITEM 42:7")
+    except m.GrammarBuildError as exc:
+        assert exc.item_id == "MYITEM 42:7"
+        assert exc.reason
+    else:
+        pytest.fail("Expected GrammarBuildError for NUL character")
+
+
+def test_grammar_builder_normal_unicode_not_rejected():
+    """Normal Unicode letters/accents/CJK must NOT be rejected."""
+    m = _import_builder()
+    vocab = frozenset(["café", "über", "日本語", "العربية", "Привет"])
+    grammar = m.GrammarBuilder().build(vocab, item_id="UNICODE 1:1")
+    assert isinstance(grammar, str)
+    assert len(grammar) > 0
+
+
+# ---------------------------------------------------------------------------
+# xgrammar compile test using vllm-env interpreter (non-skipped when available)
+# ---------------------------------------------------------------------------
+
+def test_grammar_compiles_with_vllm_env_xgrammar():
+    """Compile the grammar using the vllm-env Python interpreter's xgrammar.
+
+    Invokes /home/clear/vllm-env/bin/python with a tiny compile script.
+    Skipped if that interpreter path does not exist.
+    The standard offline test suite is kept independent from this check.
+    """
+    import subprocess
+    import os
+
+    vllm_python = "/home/clear/vllm-env/bin/python"
+    if not os.path.exists(vllm_python):
+        pytest.skip(f"{vllm_python} not found — skipping vllm-env xgrammar compile test")
+
+    m = _import_builder()
+    vocab = frozenset(["In", "the", "beginning", "God", "created", "heavens", "earth"])
+    grammar_str = m.GrammarBuilder().build(vocab, item_id="GEN 1:1")
+
+    # Escape the grammar string for safe inline embedding.
+    grammar_repr = repr(grammar_str)
+
+    script = f"""
+import sys
+try:
+    import xgrammar
+except ImportError:
+    print("SKIP:xgrammar_not_importable")
+    sys.exit(0)
+
+grammar_str = {grammar_repr}
+
+compiled = False
+errors = []
+for attr in ["Grammar", "BNFGrammar", "GrammarCompiler"]:
+    cls = getattr(xgrammar, attr, None)
+    if cls is None:
+        continue
+    for method in ["from_ebnf_string", "from_ebnf", "from_string"]:
+        fn = getattr(cls, method, None)
+        if fn is None:
+            continue
+        try:
+            fn(grammar_str)
+            compiled = True
+            break
+        except Exception as e:
+            errors.append(f"{{attr}}.{{method}}: {{e}}")
+    if compiled:
+        break
+
+if compiled:
+    print("OK")
+else:
+    print("FAIL:" + "; ".join(errors))
+    sys.exit(1)
+"""
+
+    result = subprocess.run(
+        [vllm_python, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    stdout = result.stdout.strip()
+    if stdout.startswith("SKIP:"):
+        pytest.skip(f"xgrammar not importable in vllm-env: {stdout}")
+
+    assert result.returncode == 0, (
+        f"vllm-env xgrammar compile failed (rc={result.returncode}):\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert stdout == "OK", (
+        f"vllm-env xgrammar compile reported failure: {stdout}"
+    )

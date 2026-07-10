@@ -381,3 +381,90 @@ class TestCoverageTargetsUncoveredUnits:
                     f"Coverage result (verse_idx={ex.verse_idx}) covers no new "
                     f"query tokens.  All tokens were already in semantic results."
                 )
+
+
+# ---------------------------------------------------------------------------
+# Per-call n override and single-index-build tests (quality review)
+# ---------------------------------------------------------------------------
+
+class TestExampleSelectorPerCallNOverride:
+    """Verify per-call n_semantic/n_coverage overrides and that the BM25
+    index is only built once across calls.
+    """
+
+    def test_per_call_n_coverage_override_returns_more_results(self, tiny_corpus_files):
+        """Per-call n_coverage override returns more results than the default."""
+        src, tgt = tiny_corpus_files
+        sel = _make_selector(src, tgt, n_semantic=2, n_coverage=1)
+        query = "God created the heavens and the earth"
+        results_default = sel.select(query)
+        results_expanded = sel.select(query, n_coverage=5)
+        # Expanded should return at least as many results.
+        assert len(results_expanded) >= len(results_default)
+
+    def test_per_call_n_semantic_override(self, tiny_corpus_files):
+        """Per-call n_semantic override changes the number of semantic results."""
+        src, tgt = tiny_corpus_files
+        sel = _make_selector(src, tgt, n_semantic=1, n_coverage=0)
+        query = "God created the heavens and the earth"
+        results_small = sel.select(query)
+        results_larger = sel.select(query, n_semantic=4)
+        # Larger n_semantic should yield >= results.
+        assert len(results_larger) >= len(results_small)
+
+    def test_per_call_override_does_not_change_default(self, tiny_corpus_files):
+        """A per-call override must not permanently alter the selector's defaults."""
+        src, tgt = tiny_corpus_files
+        sel = _make_selector(src, tgt, n_semantic=2, n_coverage=2)
+        query = "God created the heavens and the earth"
+
+        before = sel.select(query)
+        # Override just for this call.
+        _expanded = sel.select(query, n_coverage=8)
+        after = sel.select(query)
+
+        assert before == after, (
+            "Per-call override must not mutate the selector's default limits"
+        )
+
+    def test_select_with_override_respects_exclude_idx(self, tiny_corpus_files):
+        """Per-call n override with exclude_idx still excludes the held-out verse."""
+        src, tgt = tiny_corpus_files
+        sel = _make_selector(src, tgt, n_semantic=3, n_coverage=1)
+        results = sel.select(
+            "God created the heavens and the earth",
+            exclude_idx=0,
+            n_coverage=5,
+        )
+        assert all(ex.verse_idx != 0 for ex in results), (
+            "exclude_idx=0 must be honoured even with per-call n_coverage override"
+        )
+
+    def test_bm25_index_built_once_across_calls(self, tiny_corpus_files):
+        """The BM25 corpus index must be built once at construction, not per call.
+
+        We verify this by checking that the underlying _bm25 object is the same
+        instance across multiple select() calls (including retries with overrides).
+        """
+        src, tgt = tiny_corpus_files
+        sel = _make_selector(src, tgt, n_semantic=3, n_coverage=3)
+        bm25_id_before = id(sel._bm25)
+
+        # Multiple calls with varying per-call overrides.
+        for n_cov in [1, 3, 5, 7]:
+            sel.select("God saw the light", n_coverage=n_cov)
+
+        bm25_id_after = id(sel._bm25)
+        assert bm25_id_before == bm25_id_after, (
+            "sel._bm25 must be the same object instance across all calls "
+            "(BM25 index must NOT be rebuilt per call)"
+        )
+
+    def test_results_preserved_across_repeated_calls_with_same_args(self, tiny_corpus_files):
+        """Repeated calls with identical arguments must return identical results."""
+        src, tgt = tiny_corpus_files
+        sel = _make_selector(src, tgt, n_semantic=3, n_coverage=3)
+        query = "God created the heavens and the earth"
+        r1 = sel.select(query, exclude_idx=0, n_semantic=2, n_coverage=4)
+        r2 = sel.select(query, exclude_idx=0, n_semantic=2, n_coverage=4)
+        assert r1 == r2, "Results must be deterministic across repeated calls"

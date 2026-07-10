@@ -659,3 +659,123 @@ class TestNewLogEvents:
         assert len(item_terminals) == 1, (
             f"Expected exactly 1 terminal event for EASY, got {len(item_terminals)}: {item_terminals}"
         )
+
+
+# ---------------------------------------------------------------------------
+# §10  exclude_idx type validation (quality review)
+# ---------------------------------------------------------------------------
+
+class TestExcludeIdxTypeValidation:
+    """CLI must reject non-integer, non-null exclude_idx values."""
+
+    def _make_bad_input(self, tmp_path, exclude_idx_value_json: str, workspace):
+        """Create a bad-input JSONL with the given raw JSON value for exclude_idx."""
+        bad_inp = tmp_path / "bad_excl.jsonl"
+        # Build the JSON line manually to control the exact value type.
+        line = f'{{"item_id": "X", "source_text": "foo bar", "exclude_idx": {exclude_idx_value_json}}}\n'
+        bad_inp.write_text(line, encoding="utf-8")
+        ws2 = dict(workspace)
+        ws2["input"] = str(bad_inp)
+        return ws2
+
+    def test_bool_true_exclude_idx_rejected(self, tmp_path, workspace):
+        """exclude_idx: true (JSON boolean) must cause a non-zero exit."""
+        ws2 = self._make_bad_input(tmp_path, "true", workspace)
+        proc = _run_cli(ws2)
+        assert proc.returncode != 0, (
+            f"CLI accepted exclude_idx=true (bool); must reject it. stderr: {proc.stderr}"
+        )
+
+    def test_bool_false_exclude_idx_rejected(self, tmp_path, workspace):
+        """exclude_idx: false (JSON boolean) must cause a non-zero exit."""
+        ws2 = self._make_bad_input(tmp_path, "false", workspace)
+        proc = _run_cli(ws2)
+        assert proc.returncode != 0, (
+            f"CLI accepted exclude_idx=false (bool); must reject it. stderr: {proc.stderr}"
+        )
+
+    def test_float_exclude_idx_rejected(self, tmp_path, workspace):
+        """exclude_idx: 1.5 (JSON float) must cause a non-zero exit."""
+        ws2 = self._make_bad_input(tmp_path, "1.5", workspace)
+        proc = _run_cli(ws2)
+        assert proc.returncode != 0, (
+            f"CLI accepted exclude_idx=1.5 (float); must reject it. stderr: {proc.stderr}"
+        )
+
+    def test_string_exclude_idx_rejected(self, tmp_path, workspace):
+        """exclude_idx: \"0\" (JSON string) must cause a non-zero exit."""
+        ws2 = self._make_bad_input(tmp_path, '"0"', workspace)
+        proc = _run_cli(ws2)
+        assert proc.returncode != 0, (
+            f"CLI accepted exclude_idx=\"0\" (string); must reject it. stderr: {proc.stderr}"
+        )
+
+    def test_null_exclude_idx_still_accepted(self, tmp_path, workspace):
+        """exclude_idx: null must still be accepted after type validation."""
+        ws2 = self._make_bad_input(tmp_path, "null", workspace)
+        proc = _run_cli(ws2)
+        assert proc.returncode == 0, (
+            f"CLI rejected exclude_idx=null; must accept it. stderr: {proc.stderr}"
+        )
+
+    def test_integer_exclude_idx_accepted(self, tmp_path, workspace):
+        """exclude_idx: 0 (JSON integer) must be accepted."""
+        ws2 = self._make_bad_input(tmp_path, "0", workspace)
+        proc = _run_cli(ws2)
+        assert proc.returncode == 0, (
+            f"CLI rejected exclude_idx=0 (integer); must accept it. stderr: {proc.stderr}"
+        )
+
+    def test_parse_input_jsonl_raises_for_bool_exclude_idx(self):
+        """_parse_input_jsonl must raise ValueError for boolean exclude_idx directly."""
+        import tempfile
+        import os
+        from constrained_translation.cli import _parse_input_jsonl
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as f:
+            f.write('{"item_id": "X", "source_text": "foo", "exclude_idx": true}\n')
+            fname = f.name
+
+        try:
+            with pytest.raises(ValueError, match="bool|exclude_idx"):
+                _parse_input_jsonl(fname)
+        finally:
+            os.unlink(fname)
+
+    def test_parse_input_jsonl_raises_for_float_exclude_idx(self):
+        """_parse_input_jsonl must raise ValueError for float exclude_idx directly."""
+        import tempfile
+        import os
+        from constrained_translation.cli import _parse_input_jsonl
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as f:
+            f.write('{"item_id": "X", "source_text": "foo", "exclude_idx": 2.7}\n')
+            fname = f.name
+
+        try:
+            with pytest.raises(ValueError, match="float|exclude_idx"):
+                _parse_input_jsonl(fname)
+        finally:
+            os.unlink(fname)
+
+    def test_parse_input_jsonl_raises_for_string_exclude_idx(self):
+        """_parse_input_jsonl must raise ValueError for string exclude_idx directly."""
+        import tempfile
+        import os
+        from constrained_translation.cli import _parse_input_jsonl
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as f:
+            f.write('{"item_id": "X", "source_text": "foo", "exclude_idx": "5"}\n')
+            fname = f.name
+
+        try:
+            with pytest.raises(ValueError, match="str|exclude_idx"):
+                _parse_input_jsonl(fname)
+        finally:
+            os.unlink(fname)

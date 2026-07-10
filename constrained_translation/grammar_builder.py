@@ -146,6 +146,23 @@ class GrammarBuilder:
                 reason="attested_vocab is empty — cannot build a grammar with no tokens",
             )
 
+        # Reject tokens containing Unicode control/surrogate/private-use/unassigned
+        # characters (categories Cc, Cf, Cs, Co, Cn).  These characters have no
+        # legitimate place inside a surface token and would silently corrupt the
+        # grammar or the generated output.
+        _FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+        for tok in attested_vocab:
+            for ch in tok:
+                cat = unicodedata.category(ch)
+                if cat in _FORBIDDEN_CATEGORIES:
+                    raise GrammarBuildError(
+                        item_id=item_id,
+                        reason=(
+                            f"attested token {tok!r} contains a control/non-graphic "
+                            f"character U+{ord(ch):04X} (Unicode category {cat})"
+                        ),
+                    )
+
         # Build quoted alternatives for each attested surface token.
         # Sort for determinism.
         token_alts: list[str] = [

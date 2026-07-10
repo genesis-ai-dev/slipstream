@@ -312,7 +312,7 @@ class TestFakeBackend:
         assert len(set(ids)) == 3
 
     def test_decode_unknown_id_raises_or_returns_unk(self):
-        """decode_token on an ID not in the vocabulary should raise KeyError or return a fallback string."""
+        """decode_token on an ID not in the vocabulary should raise ValueError/KeyError or return a fallback string."""
         fb = self._make()
         # Tokenize something to populate the vocab, then try a non-existent id
         fb.tokenize("hello")
@@ -321,7 +321,7 @@ class TestFakeBackend:
             result = fb.decode_token(99999)
             # If it doesn't raise, it must return a string (UNK fallback)
             assert isinstance(result, str)
-        except KeyError:
+        except (KeyError, ValueError):
             pass  # also acceptable
 
     # --- generate ---
@@ -401,3 +401,34 @@ class TestFakeBackend:
         fb = self._make()
         result = fb.generate(prompt="check output tokens field", grammar="", max_tokens=10)
         assert result.output_tokens == len(result.token_ids)
+
+    def test_decode_unknown_id_raises_value_error(self):
+        """decode_token with an unknown ID must raise ValueError (not bare KeyError)
+        and the error message must contain the token ID.
+        """
+        fb = self._make()
+        fb.tokenize("hello")  # populate vocab
+        unknown_id = 99999
+        with pytest.raises(ValueError) as exc_info:
+            fb.decode_token(unknown_id)
+        # Must not be a bare KeyError.
+        assert "99999" in str(exc_info.value), (
+            f"ValueError message must contain the offending token_id=99999; "
+            f"got: {exc_info.value!r}"
+        )
+
+    def test_decode_unknown_id_error_is_not_key_error(self):
+        """The exception raised for an unknown token ID must NOT be a bare KeyError."""
+        fb = self._make()
+        fb.tokenize("world")
+        try:
+            fb.decode_token(88888)
+        except KeyError:
+            pytest.fail(
+                "FakeBackend.decode_token raised bare KeyError; "
+                "should raise ValueError with readable message"
+            )
+        except ValueError:
+            pass  # correct
+        except Exception as exc:
+            pytest.fail(f"Unexpected exception type {type(exc).__name__}: {exc}")

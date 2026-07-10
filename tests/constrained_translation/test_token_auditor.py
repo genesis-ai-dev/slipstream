@@ -721,3 +721,140 @@ class TestEdgeCases:
 
         assert result.passed is True
         assert au_id in provenance
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Quality-review tests: decode caching, surface-composition only for licensed
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestDecodeCaching:
+    """decode_token results must be cached by unique token ID (called once per ID)."""
+
+    def test_decode_called_once_per_unique_id(self):
+        """backend.decode_token must be called exactly once per unique token ID,
+        even when the same ID appears multiple times in token_ids.
+        """
+        fb = FakeBackend()
+        ex = _make_example(verse_idx=0, target="Au commencement Dieu")
+        au_id = fb.tokenize("Au")[0]
+        comm_id = fb.tokenize("commencement")[0]
+        attested_vocab = frozenset({"Au", "commencement", "Dieu"})
+
+        decode_call_counts: dict = {}
+
+        class _CountingBackend:
+            def decode_token(self, token_id: int) -> str:
+                decode_call_counts[token_id] = decode_call_counts.get(token_id, 0) + 1
+                return fb.decode_token(token_id)
+
+            def tokenize(self, text: str) -> list:
+                return fb.tokenize(text)
+
+            def is_available(self) -> bool:
+                return True
+
+            def generate(self, *args, **kwargs):  # pragma: no cover
+                return fb.generate(*args, **kwargs)
+
+        auditor = TokenAuditor()
+        # au_id appears 3 times, comm_id appears 2 times.
+        auditor.audit(
+            token_ids=[au_id, comm_id, au_id, au_id, comm_id],
+            attested_vocab=attested_vocab,
+            backend=_CountingBackend(),
+            examples=[ex],
+        )
+
+        # Each unique ID must have been decoded exactly once.
+        assert decode_call_counts.get(au_id, 0) == 1, (
+            f"decode_token called {decode_call_counts.get(au_id, 0)} times for "
+            f"au_id={au_id}; must be called exactly once per unique ID"
+        )
+        assert decode_call_counts.get(comm_id, 0) == 1, (
+            f"decode_token called {decode_call_counts.get(comm_id, 0)} times for "
+            f"comm_id={comm_id}; must be called exactly once per unique ID"
+        )
+
+
+class TestSurfaceCompositionOnlyForLicensedIDs:
+    """Surface-composition violations must not be generated for unlicensed IDs.
+
+    An unlicensed ID already produces an ID-level licence violation at step 2c.
+    Adding a surface-composition violation for the same token would double-count
+    the failure and obscure the actual provenance problem.
+    """
+
+    def test_unlicensed_id_produces_id_violation_not_surface_violation(self):
+        """When a token ID is not in the licence, the violation is an ID-level
+        licence failure, not a surface-composition failure.
+
+        Setup:
+          - Example target: "hello world"
+          - Licence: contains IDs for "hello" and "world"
+          - Generated token: ID for "foreign" (not in licence, not in attested_vocab)
+          - attested_vocab: {"hello", "world"}
+
+        Expected: one violation mentioning token_id, no surface violation.
+        """
+        fb = FakeBackend()
+        ex = _make_example(verse_idx=0, target="hello world")
+        # Build licence: IDs for hello + world.
+        auditor = TokenAuditor()
+        licence = auditor.build_license([ex], fb)
+
+        # Now generate a token that is NOT in the licence.
+        foreign_id = fb.tokenize("foreign")[0]
+        assert foreign_id not in licence, "test pre-condition: foreign must not be licensed"
+
+        attested_vocab = frozenset({"hello", "world"})
+
+        result, _ = auditor.audit(
+            token_ids=[foreign_id],
+            attested_vocab=attested_vocab,
+            backend=fb,
+            license=licence,
+        )
+
+        assert not result.passed
+        # There must be exactly one violation (ID-level), not two (ID + surface).
+        # The violation must mention the token_id.
+        id_violations = [v for v in result.violations if str(foreign_id) in v]
+        surface_violations = [v for v in result.violations if "subword recombination" in v]
+        assert len(id_violations) == 1, (
+            f"Expected exactly 1 ID-level violation for foreign_id={foreign_id}; "
+            f"got: {result.violations}"
+        )
+        assert len(surface_violations) == 0, (
+            f"Surface-composition check must NOT fire for unlicensed IDs; "
+            f"got surface violations: {surface_violations}"
+        )
+
+    def test_licensed_ids_still_checked_for_surface_composition(self):
+        """Even when all IDs are licensed, novel recombined surface words still fail.
+
+        Two pieces are individually licensed (from different verses) but their
+        reconstructed surface word is not in attested_vocab.
+        """
+        backend = _SubwordMockBackend()
+        auditor = TokenAuditor()
+
+        # Both IDs are licensed.
+        precomputed_licence: TokenLicense = {100: [0], 101: [1]}
+        # "hello" (reconstructed from ▁hel + lo) is NOT in attested_vocab.
+        attested_vocab = frozenset({"hel", "lo"})
+
+        result, _ = auditor.audit(
+            token_ids=[100, 101],
+            attested_vocab=attested_vocab,
+            backend=backend,
+            license=precomputed_licence,
+        )
+
+        assert not result.passed, (
+            "Recombined surface word 'hello' is not in attested_vocab → must fail"
+        )
+        surface_violations = [v for v in result.violations if "hello" in v]
+        assert surface_violations, (
+            f"Expected a surface violation mentioning 'hello'; got: {result.violations}"
+        )

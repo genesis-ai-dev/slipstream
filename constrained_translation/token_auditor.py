@@ -329,8 +329,11 @@ class TokenAuditor:
 
         # ── Step 3: Surface-composition check ───────────────────────────────
         # Reconstruct full surface words from the (ordered) sequence of decoded
-        # pieces and verify each word against attested_vocab.
-        all_decoded_pieces = [decoded_map[tid] for tid in token_ids]
+        # pieces for IDs that are licensed (unlicensed IDs already recorded a
+        # violation at Step 2c; we must not double-count them as surface failures).
+        # Also cache decode_token calls — already done via decoded_map above.
+        licensed_token_ids = [tid for tid in token_ids if tid in full_licence]
+        all_decoded_pieces = [decoded_map[tid] for tid in licensed_token_ids]
         surface_words = _reconstruct_surface_words(all_decoded_pieces)
 
         for word in surface_words:

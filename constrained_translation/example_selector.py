@@ -75,6 +75,8 @@ class ExampleSelector:
         self,
         query: str,
         exclude_idx: Optional[int] = None,
+        n_semantic: Optional[int] = None,
+        n_coverage: Optional[int] = None,
     ) -> tuple[AlignedExample, ...]:
         """Return at most n_semantic + n_coverage deduplicated AlignedExamples.
 
@@ -86,6 +88,12 @@ class ExampleSelector:
             0-based corpus index of the held-out / query verse.  This verse is
             excluded from results by its stable integer index (not by text
             match).  Pass None to include all verses.
+        n_semantic:
+            Override the number of semantic (BM25) candidates for this call.
+            Defaults to the value passed at construction time.
+        n_coverage:
+            Override the number of coverage-targeted candidates for this call.
+            Defaults to the value passed at construction time.
 
         Returns
         -------
@@ -94,13 +102,15 @@ class ExampleSelector:
             All entries have evidence_tier=1.
         """
         exclude: int = exclude_idx if exclude_idx is not None else -1
+        _n_semantic = n_semantic if n_semantic is not None else self._n_semantic
+        _n_coverage = n_coverage if n_coverage is not None else self._n_coverage
 
         # ----------------------------------------------------------------
         # Stage 1 — semantic retrieval via BM25
         # ----------------------------------------------------------------
         # BM25Query._simple_search returns List[Tuple[1-based_idx, src, tgt, score]]
         raw_semantic = self._bm25._simple_search(
-            query, top_k=self._n_semantic, exclude_idx=exclude
+            query, top_k=_n_semantic, exclude_idx=exclude
         )
 
         semantic_examples: list[AlignedExample] = []
@@ -143,7 +153,7 @@ class ExampleSelector:
 
         coverage_examples: list[AlignedExample] = []
 
-        while remaining_units and len(coverage_examples) < self._n_coverage:
+        while remaining_units and len(coverage_examples) < _n_coverage:
             best_idx: int | None = None
             best_gain: int = 0
             best_score: float = -1.0

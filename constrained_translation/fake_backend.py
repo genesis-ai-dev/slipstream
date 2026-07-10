@@ -94,10 +94,17 @@ class FakeBackend:
     def decode_token(self, token_id: int) -> str:
         """Return the surface string for *token_id*.
 
-        Raises KeyError if *token_id* has never been assigned by this
-        instance (i.e. tokenize() was never called for that token).
+        Raises ValueError (not bare KeyError) if *token_id* has never been
+        assigned by this instance (i.e. tokenize() was never called for that
+        token).  The error message includes the offending token ID.
         """
-        return self._id_to_token[token_id]
+        try:
+            return self._id_to_token[token_id]
+        except KeyError:
+            raise ValueError(
+                f"FakeBackend.decode_token: unknown token_id={token_id!r} "
+                f"(has never been assigned by this FakeBackend instance)"
+            ) from None
 
     def generate(
         self,

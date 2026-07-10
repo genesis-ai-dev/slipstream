@@ -176,9 +176,21 @@ def test_batch_loop_hard_failure_pct(tmp_path):
 
     results, rollup = runner.run(items)
 
-    # At least one item must succeed
+    # ── Diagnostic: total-failure guard ────────────────────────────────
     assert rollup.hard_failure_pct < 100.0, (
-        f"All items failed: hard_failure_pct={rollup.hard_failure_pct}"
+        f"All 3 items failed hard: hard_failure_pct={rollup.hard_failure_pct:.1f}%"
     )
-    # Preferred: most items succeed
-    assert rollup.hard_failure_pct < 100.0, "Expected hard_failure_pct < 100%"
+
+    # ── Hard gate: at least 2 of 3 items accepted (hard_failure_pct <= 33.34) ──
+    accepted = sum(1 for r in results if not r.hard_failure)
+    assert accepted >= 2, (
+        f"Smoke gate: at least 2 of 3 items must be accepted end-to-end; "
+        f"got accepted={accepted}, hard_failure_pct={rollup.hard_failure_pct:.1f}%\\n"
+        + "\\n".join(
+            f"  [{r.item_id}] hard_failure={r.hard_failure} error={r.error!r}"
+            for r in results
+        )
+    )
+    assert rollup.hard_failure_pct <= 33.34, (
+        f"hard_failure_pct={rollup.hard_failure_pct:.2f}% exceeds 33.34% gate"
+    )

@@ -224,7 +224,8 @@ class BatchRunner:
         results: list[TranslationResult] = []
 
         with JSONLLogger(self._log_path) as logger:
-            # Build ExampleSelector once (loads BM25 index)
+            # Build ExampleSelector once per run (loads BM25 index).
+            # Retry calls use per-call n_coverage overrides — the index is NOT rebuilt.
             selector = ExampleSelector(
                 source_file=self._source_file,
                 target_file=self._target_file,
@@ -292,15 +293,13 @@ class BatchRunner:
             for retry in range(1, self._max_retries + 1):
                 old_example_ids = [ex.verse_idx for ex in examples]
 
-                # Rebuild selector with expanded n_coverage
+                # Use per-call n_coverage override — the BM25 index is NOT rebuilt
                 expanded_n_coverage = self._n_coverage + retry * _RETRY_COVERAGE_INCREMENT
-                retry_selector = ExampleSelector(
-                    source_file=self._source_file,
-                    target_file=self._target_file,
-                    n_semantic=self._n_semantic,
+                examples = selector.select(
+                    source_text,
+                    exclude_idx=exclude_idx,
                     n_coverage=expanded_n_coverage,
                 )
-                examples = retry_selector.select(source_text, exclude_idx=exclude_idx)
                 new_example_ids = [ex.verse_idx for ex in examples]
 
                 # Re-check coverage
