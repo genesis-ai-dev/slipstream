@@ -663,7 +663,7 @@ Each task follows TDD: write the failing test first, then implement, then confir
 - `test_grammar_builder_empty_vocab_raises_grammar_build_error`
 - `test_grammar_builder_output_is_string`
 - `test_grammar_builder_attested_tokens_present_in_grammar`
-- `test_grammar_builder_unk_markers_present_in_grammar`
+- `test_grammar_builder_unk_markers_absent_from_grammar` — markers are inserted deterministically after model generation
 - `test_grammar_builder_special_chars_escaped`
 - `test_grammar_builder_no_raw_subword_pieces` — asserts grammar contains no token IDs, only surface strings
 - `test_grammar_build_error_carries_item_id`
@@ -701,7 +701,7 @@ Each task follows TDD: write the failing test first, then implement, then confir
 **Tests (must fail first):**
 - `test_auditor_pass_when_all_tokens_attested`
 - `test_auditor_fail_when_foreign_token_present`
-- `test_auditor_unk_markers_count_as_passing`
+- `test_auditor_unk_markers_fail_in_model_output` — model-generated markers violate the attested-output contract
 - `test_auditor_punctuation_passes`
 - `test_auditor_whitespace_passes`
 - `test_auditor_violations_list_is_populated`
