@@ -13,7 +13,7 @@ Eight mutually exclusive primary outcomes:
                               unit exists in translated source evidence. Engineering
                               / normalisation defect.
 3. ACCEPTED_LICENSED         Source supported, backend called, all audits passed,
-                              no model-generated UNK.
+                              no model-generated UNK, and final_translation is not None.
 4. CONSTRAINT_ARTIFACT       Source supported; visible lexical surface is licensed;
                               request/output rejected solely by grammar, tokeniser,
                               byte-decode, terminal-control, layout, or normalisation
@@ -35,14 +35,15 @@ Classification decision order (priority descending)
 ----------------------------------------------------
 1.  false_abstention_detected → FALSE_SOURCE_ABSTENTION
 2.  not source_supported AND not backend_called → SAFE_SOURCE_ABSTENTION
-3.  backend_called AND model_generated_unk → MODEL_GENERATED_UNK
+3.  backend_called AND raw_generation is None → OTHER_HARD_FAILURE
+3b. backend_called AND (model_generated_unk OR raw_generation contains [UNK:<src>]) → MODEL_GENERATED_UNK
 4.  backend_called AND (not exact_id_licensed OR not visible_surface_licensed):
         if final_translation is not None → ESCAPED_HALLUCINATION
         else                             → EMITTED_HALLUCINATION
 5.  backend_called AND not audit_passed AND (exact_id_licensed AND visible_surface_licensed)
         → CONSTRAINT_ARTIFACT
 6.  backend_called AND audit_passed AND source_supported AND not model_generated_unk
-        → ACCEPTED_LICENSED
+        AND final_translation is not None → ACCEPTED_LICENSED
 7.  everything else → OTHER_HARD_FAILURE
 
 Design notes
@@ -59,8 +60,27 @@ Design notes
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
+
+# ---------------------------------------------------------------------------
+# Reserved UNK marker detector
+# ---------------------------------------------------------------------------
+
+# The reserved marker syntax is [UNK:<source>] where <source> is non-empty.
+# This is case-sensitive: only uppercase UNK is the reserved form.
+# [unk:x] or [UNK] (no colon/source) are not reserved markers.
+_RESERVED_UNK_MARKER_RE = re.compile(r'\[UNK:[^\]]+\]')
+
+
+def _raw_contains_reserved_unk_marker(text: str) -> bool:
+    """Return True iff *text* contains the reserved [UNK:<source>] marker syntax.
+
+    Narrow, explicit detector — not broad substring matching.  Only matches
+    the exact form ``[UNK:<non-empty-source>]`` (case-sensitive uppercase UNK).
+    """
+    return bool(_RESERVED_UNK_MARKER_RE.search(text))
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +158,12 @@ class TranslationEvidence:
 
     model_generated_unk
         True iff the model spontaneously emitted a [UNK:…] marker. The
-        classifier reads this typed boolean field; it does NOT text-search
-        raw_generation or audit_reasons.
+        classifier reads this typed boolean field AND also checks raw_generation
+        text for the reserved [UNK:<source>] marker syntax (case-sensitive) as a
+        safety override — if raw_generation contains the marker and backend was
+        called, MODEL_GENERATED_UNK is returned regardless of this flag's value.
+        Deterministic pre-generation UNK insertion only occurs before backend call
+        so the marker cannot legitimately appear in raw_generation post-generation.
 
     Source coverage
     ---------------
@@ -200,6 +224,19 @@ class EscapedHallucinationError(RuntimeError):
     """
 
 
+class MissingForensicArtifactError(RuntimeError):
+    """Raised by ``guard_forensic_artifact_present`` when a rejected generated
+    outcome (EMITTED_HALLUCINATION, CONSTRAINT_ARTIFACT, MODEL_GENERATED_UNK,
+    ESCAPED_HALLUCINATION) is missing its required ``surfaced_failure_artifact``.
+
+    Rejected outcomes require the forensic artifact for downstream diagnostics
+    and audit trails. Absence is a loud invariant violation; callers must supply
+    the rejected text before the outcome is finalised.
+
+    The error message includes the item_id and outcome name for easy tracing.
+    """
+
+
 # ---------------------------------------------------------------------------
 # classify
 # ---------------------------------------------------------------------------
@@ -211,13 +248,19 @@ def classify(evidence: TranslationEvidence) -> Outcome:
 
     1. ``false_abstention_detected`` → FALSE_SOURCE_ABSTENTION
     2. ``not source_supported and not backend_called`` → SAFE_SOURCE_ABSTENTION
-    3. ``backend_called and model_generated_unk`` → MODEL_GENERATED_UNK
+    3. ``backend_called and raw_generation is None`` → OTHER_HARD_FAILURE
+    3b.``backend_called and (model_generated_unk or raw_generation contains [UNK:<src>])``
+           → MODEL_GENERATED_UNK
+       Raw-marker check is a safety override: deterministic pre-generation UNK
+       insertion occurs before the backend call, so the reserved marker cannot
+       legitimately appear in raw_generation post-generation.
     4. ``backend_called and (not exact_id_licensed or not visible_surface_licensed)``:
            → ESCAPED_HALLUCINATION if ``final_translation is not None``
            → EMITTED_HALLUCINATION otherwise
     5. ``backend_called and not audit_passed and exact_id_licensed and visible_surface_licensed``
            → CONSTRAINT_ARTIFACT
-    6. ``backend_called and audit_passed and source_supported and not model_generated_unk``
+    6. ``backend_called and audit_passed and source_supported and not model_generated_unk
+          and final_translation is not None``
            → ACCEPTED_LICENSED
     7. everything else → OTHER_HARD_FAILURE
 
@@ -244,13 +287,16 @@ def classify(evidence: TranslationEvidence) -> Outcome:
     # All remaining priorities require backend_called=True
     if ev.backend_called:
 
-        # Priority 2b: backend was called but produced no raw output (crash/timeout)
+        # Priority 3: backend was called but produced no raw output (crash/timeout)
         # This is a hard failure; no model output means no hallucination to classify.
         if ev.raw_generation is None:
             return Outcome.OTHER_HARD_FAILURE
 
-        # Priority 3: model spontaneously emitted [UNK:…]
-        if ev.model_generated_unk:
+        # Priority 3b: model spontaneously emitted [UNK:…]
+        # Safety override: if raw_generation contains the reserved marker syntax,
+        # force MODEL_GENERATED_UNK even when model_generated_unk flag is False.
+        _raw_has_marker = _raw_contains_reserved_unk_marker(ev.raw_generation)
+        if ev.model_generated_unk or _raw_has_marker:
             return Outcome.MODEL_GENERATED_UNK
 
         # Priority 4: unlicensed token ID or unattested visible surface
@@ -263,8 +309,9 @@ def classify(evidence: TranslationEvidence) -> Outcome:
         if not ev.audit_passed and ev.exact_id_licensed and ev.visible_surface_licensed:
             return Outcome.CONSTRAINT_ARTIFACT
 
-        # Priority 6: clean acceptance
-        if ev.audit_passed and ev.source_supported and not ev.model_generated_unk:
+        # Priority 6: clean acceptance — requires final_translation is not None
+        if (ev.audit_passed and ev.source_supported and not ev.model_generated_unk
+                and ev.final_translation is not None):
             return Outcome.ACCEPTED_LICENSED
 
     # Priority 7: none of the above fit
@@ -308,6 +355,57 @@ def guard_no_escaped_hallucination(
 
 
 # ---------------------------------------------------------------------------
+# guard_forensic_artifact_present
+# ---------------------------------------------------------------------------
+
+# Outcomes that require surfaced_failure_artifact to be set (not None).
+_FORENSIC_ARTIFACT_REQUIRED: frozenset[Outcome] = frozenset({
+    Outcome.EMITTED_HALLUCINATION,
+    Outcome.CONSTRAINT_ARTIFACT,
+    Outcome.MODEL_GENERATED_UNK,
+    Outcome.ESCAPED_HALLUCINATION,
+})
+
+
+def guard_forensic_artifact_present(
+    outcome: Outcome,
+    evidence: TranslationEvidence,
+) -> None:
+    """Raise ``MissingForensicArtifactError`` if *outcome* requires a forensic
+    artifact but ``evidence.surfaced_failure_artifact`` is ``None``.
+
+    Rejected generated outcomes (EMITTED_HALLUCINATION, CONSTRAINT_ARTIFACT,
+    MODEL_GENERATED_UNK, ESCAPED_HALLUCINATION) must retain the rejected text
+    in ``surfaced_failure_artifact`` for downstream diagnostics and audit trails.
+    For ESCAPED_HALLUCINATION the guard additionally verifies that the raw
+    evidence is preserved (raw_generation is available on the evidence object).
+
+    For all other outcomes this function is a no-op.
+
+    Parameters
+    ----------
+    outcome:
+        The result of ``classify(evidence)``.
+    evidence:
+        The same ``TranslationEvidence`` used to derive *outcome*.
+
+    Raises
+    ------
+    MissingForensicArtifactError
+        When *outcome* is one of the four rejection outcomes and
+        ``evidence.surfaced_failure_artifact`` is ``None``.
+    """
+    if outcome in _FORENSIC_ARTIFACT_REQUIRED:
+        if evidence.surfaced_failure_artifact is None:
+            raise MissingForensicArtifactError(
+                f"Missing surfaced_failure_artifact for {outcome.value} "
+                f"on item {evidence.item_id!r}. "
+                f"Rejected outcomes must retain the forensic text artifact for diagnostics. "
+                f"raw_generation={evidence.raw_generation!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # OutcomeRollup dataclass
 # ---------------------------------------------------------------------------
 
@@ -322,7 +420,10 @@ class OutcomeRollup:
 
     n_generated
         Units for which the backend was actually called
-        (``backend_called=True``).
+        (``backend_called=True``). This denominator includes ALL backend-called
+        units regardless of their final outcome, including those that end in
+        OTHER_HARD_FAILURE. It therefore represents the total generation attempts
+        made by the backend, not just successful or clean completions.
 
     n_supported
         Units where ``source_supported=True``.

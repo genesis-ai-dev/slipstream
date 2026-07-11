@@ -26,8 +26,10 @@ from constrained_translation.experiment.outcomes import (
     Outcome,
     TranslationEvidence,
     EscapedHallucinationError,
+    MissingForensicArtifactError,
     classify,
     guard_no_escaped_hallucination,
+    guard_forensic_artifact_present,
     OutcomeRollup,
     compute_rollup,
 )
@@ -1067,20 +1069,354 @@ class TestSentinelFieldGuards:
         assert ev.final_translation is not None
         assert classify(ev) == Outcome.ESCAPED_HALLUCINATION
 
-    def test_model_unk_flag_cannot_be_inferred_from_raw_generation_text(self):
-        """model_generated_unk must be an explicit boolean field, not text-parsed."""
-        # Evidence has [UNK:...] in raw text but model_generated_unk=False
-        # (e.g. it was pre-inserted by UNKDetector)
+    def test_raw_unk_marker_in_raw_generation_always_model_generated_unk(self):
+        """If raw_generation contains the reserved [UNK:…] marker and backend was called,
+        outcome is MODEL_GENERATED_UNK regardless of the model_generated_unk flag value.
+
+        Deterministic pre-generation UNK insertion occurs BEFORE the backend call, so
+        raw_generation never legitimately contains the marker when backend_called=True.
+        A false-False flag must not suppress the safety classification.
+        """
         ev = _base_evidence(
             raw_generation="Au début [UNK:selah] fut",
-            model_generated_unk=False,
+            model_generated_unk=False,   # caller flag is False — must be overridden
             audit_passed=True,
+            final_translation="Au début [UNK:selah] fut",
         )
-        # Classifier reads the flag, not the text — so it's still ACCEPTED_LICENSED
-        assert classify(ev) == Outcome.ACCEPTED_LICENSED
+        # Safety: reserved marker in raw text dominates the (incorrect) flag
+        assert classify(ev) == Outcome.MODEL_GENERATED_UNK
 
     def test_source_supported_false_and_backend_not_called_explicit_safe_abstention(self):
         """source_supported=False AND backend_called=False is SAFE abstention, not OTHER."""
         ev = _safe_abstention_evidence()
         assert classify(ev) == Outcome.SAFE_SOURCE_ABSTENTION
         assert classify(ev) != Outcome.OTHER_HARD_FAILURE
+
+
+# ===========================================================================
+# §17 — Raw UNK marker safety (new safety gap fixes)
+# ===========================================================================
+
+# Narrow reserved-marker detector: [UNK:<source>] with non-empty source, case-sensitive.
+# The pattern is exact: opening bracket, UNK, colon, non-empty content, closing bracket.
+
+class TestRawUNKMarkerSafety:
+    """Gap 1: raw model output containing [UNK:…] must always yield MODEL_GENERATED_UNK
+    when backend was called, even if caller sets model_generated_unk=False.
+
+    Deterministic pre-generation UNK insertion happens BEFORE backend call, so the
+    marker can never legitimately appear in raw_generation when backend_called=True.
+    """
+
+    def test_unk_marker_embedded_in_raw_generation_overrides_false_flag(self):
+        """Marker anywhere in full raw text → MODEL_GENERATED_UNK, flag=False ignored."""
+        ev = _base_evidence(
+            raw_generation="Au commencement [UNK:bara] Dieu",
+            model_generated_unk=False,
+            audit_passed=True,
+            final_translation="Au commencement [UNK:bara] Dieu",
+        )
+        assert classify(ev) == Outcome.MODEL_GENERATED_UNK
+
+    def test_unk_marker_at_start_of_raw_generation(self):
+        """Marker at start of raw_generation → MODEL_GENERATED_UNK."""
+        ev = _base_evidence(
+            raw_generation="[UNK:bereshit] au commencement",
+            model_generated_unk=False,
+            audit_passed=True,
+            final_translation="[UNK:bereshit] au commencement",
+        )
+        assert classify(ev) == Outcome.MODEL_GENERATED_UNK
+
+    def test_unk_marker_at_end_of_raw_generation(self):
+        """Marker at end of raw_generation → MODEL_GENERATED_UNK."""
+        ev = _base_evidence(
+            raw_generation="Au commencement [UNK:selah]",
+            model_generated_unk=False,
+            audit_passed=True,
+            final_translation="Au commencement [UNK:selah]",
+        )
+        assert classify(ev) == Outcome.MODEL_GENERATED_UNK
+
+    def test_unk_marker_with_multiword_source(self):
+        """[UNK:multi word source] is the reserved marker form."""
+        ev = _base_evidence(
+            raw_generation="Au [UNK:multi word] début",
+            model_generated_unk=False,
+            audit_passed=True,
+            final_translation="Au [UNK:multi word] début",
+        )
+        assert classify(ev) == Outcome.MODEL_GENERATED_UNK
+
+    def test_no_unk_marker_in_raw_generation_flag_true_still_unk(self):
+        """If flag=True but no marker in raw text, flag still drives MODEL_GENERATED_UNK."""
+        ev = _model_unk_evidence()  # flag=True, raw_generation has marker
+        assert classify(ev) == Outcome.MODEL_GENERATED_UNK
+
+    def test_false_unk_flag_with_no_marker_in_raw_is_not_unk(self):
+        """model_generated_unk=False AND no marker in raw_generation → not MODEL_GENERATED_UNK."""
+        ev = _base_evidence(
+            raw_generation="Au commencement Dieu",
+            model_generated_unk=False,
+            audit_passed=True,
+            final_translation="Au commencement Dieu",
+        )
+        assert classify(ev) == Outcome.ACCEPTED_LICENSED
+
+    def test_unk_marker_uppercase_reserved_syntax_only(self):
+        """Only exact [UNK:<source>] syntax is the reserved marker; [unk:x] is NOT matched."""
+        ev = _base_evidence(
+            raw_generation="Au [unk:selah] début",  # lowercase — not the reserved pattern
+            model_generated_unk=False,
+            audit_passed=True,
+            final_translation="Au [unk:selah] début",
+        )
+        # lowercase does not match the reserved marker → ACCEPTED_LICENSED (flag=False)
+        assert classify(ev) == Outcome.ACCEPTED_LICENSED
+
+    def test_bracket_unk_without_colon_is_not_reserved_marker(self):
+        """[UNK] without colon and source is not the reserved marker syntax."""
+        ev = _base_evidence(
+            raw_generation="Texte [UNK] quelconque",
+            model_generated_unk=False,
+            audit_passed=True,
+            final_translation="Texte [UNK] quelconque",
+        )
+        # [UNK] alone is not the reserved [UNK:<source>] pattern
+        assert classify(ev) == Outcome.ACCEPTED_LICENSED
+
+    def test_model_generated_unk_true_dominates_audit_passed_true(self):
+        """MODEL_GENERATED_UNK must dominate even when audit_passed=True."""
+        ev = _base_evidence(
+            raw_generation="Au [UNK:let] début",
+            model_generated_unk=True,
+            audit_passed=True,
+            final_translation=None,
+            surfaced_failure_artifact="Au [UNK:let] début",
+        )
+        assert classify(ev) == Outcome.MODEL_GENERATED_UNK
+
+    def test_raw_unk_marker_model_generated_unk_true_audit_passed_true_dominance(self):
+        """Both flag=True and marker in raw text → MODEL_GENERATED_UNK; audit dominance."""
+        ev = _base_evidence(
+            raw_generation="Au [UNK:selah] commencement",
+            model_generated_unk=True,
+            audit_passed=True,
+            surfaced_failure_artifact="Au [UNK:selah] commencement",
+            final_translation=None,
+        )
+        outcome = classify(ev)
+        assert outcome == Outcome.MODEL_GENERATED_UNK
+
+    def test_backend_not_called_raw_unk_marker_is_safe_abstention_not_model_unk(self):
+        """If backend was NOT called, a [UNK:…] in raw_generation is impossible/irrelevant.
+        The upstream gate ensures this; the classifier still reads backend_called=False
+        and cannot reach MODEL_GENERATED_UNK.
+        """
+        ev = _safe_abstention_evidence(
+            raw_generation=None,  # no backend → no raw output at all
+            model_generated_unk=False,
+        )
+        assert classify(ev) == Outcome.SAFE_SOURCE_ABSTENTION
+
+
+# ===========================================================================
+# §18 — ACCEPTED_LICENSED requires final_translation is not None
+# ===========================================================================
+
+class TestAcceptedLicensedRequiresFinalTranslation:
+    """Gap 2: ACCEPTED_LICENSED must require final_translation is not None.
+    audit_passed=True with no final_translation is OTHER_HARD_FAILURE.
+    """
+
+    def test_audit_passed_no_final_translation_is_other_hard_failure(self):
+        """audit_passed=True but final_translation=None → OTHER_HARD_FAILURE, not ACCEPTED."""
+        ev = _base_evidence(
+            audit_passed=True,
+            final_translation=None,  # missing accepted output
+        )
+        assert classify(ev) == Outcome.OTHER_HARD_FAILURE
+
+    def test_audit_passed_no_final_translation_not_accepted_licensed(self):
+        """Classifier must not return ACCEPTED_LICENSED when final_translation is None."""
+        ev = _base_evidence(
+            audit_passed=True,
+            final_translation=None,
+        )
+        assert classify(ev) != Outcome.ACCEPTED_LICENSED
+
+    def test_accepted_licensed_requires_both_audit_and_translation(self):
+        """Only when both audit_passed=True AND final_translation is not None → ACCEPTED."""
+        ev_full = _base_evidence(audit_passed=True, final_translation="Au commencement")
+        ev_no_trans = _base_evidence(audit_passed=True, final_translation=None)
+        assert classify(ev_full) == Outcome.ACCEPTED_LICENSED
+        assert classify(ev_no_trans) != Outcome.ACCEPTED_LICENSED
+
+    def test_audit_passed_empty_string_final_translation_is_accepted(self):
+        """Empty string (not None) is a valid final_translation for ACCEPTED_LICENSED."""
+        # An empty translation is an edge case but not None — still accepted
+        ev = _base_evidence(audit_passed=True, final_translation="")
+        # Empty string is not None, so the requirement is met
+        assert classify(ev) == Outcome.ACCEPTED_LICENSED
+
+
+# ===========================================================================
+# §19 — Rejection-artifact forensic guards
+# ===========================================================================
+
+class TestForensicArtifactGuards:
+    """Gap 3: EMITTED_HALLUCINATION, CONSTRAINT_ARTIFACT, MODEL_GENERATED_UNK must
+    retain surfaced_failure_artifact. guard_forensic_artifact_present raises
+    MissingForensicArtifactError loudly when it is absent.
+
+    ESCAPED_HALLUCINATION involves final translation; guard must preserve both
+    raw and surfaced evidence in the error.
+    """
+
+    # --- EMITTED_HALLUCINATION ---
+
+    def test_guard_forensic_raises_for_emitted_hallucination_without_artifact(self):
+        """MissingForensicArtifactError raised when surfaced_failure_artifact is None."""
+        ev = _emitted_hallucination_evidence(surfaced_failure_artifact=None)
+        outcome = classify(ev)
+        assert outcome == Outcome.EMITTED_HALLUCINATION
+        with pytest.raises(MissingForensicArtifactError):
+            guard_forensic_artifact_present(outcome, ev)
+
+    def test_guard_forensic_passes_for_emitted_hallucination_with_artifact(self):
+        """No raise when surfaced_failure_artifact is present."""
+        ev = _emitted_hallucination_evidence()
+        outcome = classify(ev)
+        guard_forensic_artifact_present(outcome, ev)  # must not raise
+
+    # --- CONSTRAINT_ARTIFACT ---
+
+    def test_guard_forensic_raises_for_constraint_artifact_without_artifact(self):
+        """MissingForensicArtifactError raised for CONSTRAINT_ARTIFACT with no artifact."""
+        ev = _constraint_artifact_evidence(surfaced_failure_artifact=None)
+        outcome = classify(ev)
+        assert outcome == Outcome.CONSTRAINT_ARTIFACT
+        with pytest.raises(MissingForensicArtifactError):
+            guard_forensic_artifact_present(outcome, ev)
+
+    def test_guard_forensic_passes_for_constraint_artifact_with_artifact(self):
+        """No raise when surfaced_failure_artifact is present for CONSTRAINT_ARTIFACT."""
+        ev = _constraint_artifact_evidence()
+        outcome = classify(ev)
+        guard_forensic_artifact_present(outcome, ev)  # must not raise
+
+    # --- MODEL_GENERATED_UNK ---
+
+    def test_guard_forensic_raises_for_model_unk_without_artifact(self):
+        """MissingForensicArtifactError raised for MODEL_GENERATED_UNK with no artifact."""
+        ev = _model_unk_evidence(surfaced_failure_artifact=None)
+        outcome = classify(ev)
+        assert outcome == Outcome.MODEL_GENERATED_UNK
+        with pytest.raises(MissingForensicArtifactError):
+            guard_forensic_artifact_present(outcome, ev)
+
+    def test_guard_forensic_passes_for_model_unk_with_artifact(self):
+        """No raise when surfaced_failure_artifact is present for MODEL_GENERATED_UNK."""
+        ev = _model_unk_evidence()
+        outcome = classify(ev)
+        guard_forensic_artifact_present(outcome, ev)  # must not raise
+
+    # --- ESCAPED_HALLUCINATION ---
+
+    def test_guard_forensic_raises_for_escaped_hallucination_without_raw(self):
+        """ESCAPED_HALLUCINATION guard must include raw and surfaced evidence.
+        Absent surfaced_failure_artifact → MissingForensicArtifactError.
+        """
+        ev = _escaped_hallucination_evidence(surfaced_failure_artifact=None)
+        outcome = classify(ev)
+        assert outcome == Outcome.ESCAPED_HALLUCINATION
+        with pytest.raises(MissingForensicArtifactError):
+            guard_forensic_artifact_present(outcome, ev)
+
+    def test_guard_forensic_passes_for_escaped_hallucination_with_artifact(self):
+        """No MissingForensicArtifactError when surfaced_failure_artifact is present."""
+        ev = _escaped_hallucination_evidence()
+        outcome = classify(ev)
+        guard_forensic_artifact_present(outcome, ev)  # must not raise
+
+    # --- Non-rejection outcomes: guard is a no-op ---
+
+    def test_guard_forensic_noop_for_accepted_licensed(self):
+        """ACCEPTED_LICENSED has no artifact requirement; guard is a no-op."""
+        ev = _base_evidence()
+        outcome = classify(ev)
+        guard_forensic_artifact_present(outcome, ev)  # must not raise
+
+    def test_guard_forensic_noop_for_safe_abstention(self):
+        """SAFE_SOURCE_ABSTENTION is a no-op for the forensic guard."""
+        ev = _safe_abstention_evidence()
+        outcome = classify(ev)
+        guard_forensic_artifact_present(outcome, ev)  # must not raise
+
+    def test_guard_forensic_noop_for_false_abstention(self):
+        """FALSE_SOURCE_ABSTENTION is a no-op for the forensic guard."""
+        ev = _false_abstention_evidence()
+        outcome = classify(ev)
+        guard_forensic_artifact_present(outcome, ev)  # must not raise
+
+    def test_guard_forensic_noop_for_other_hard_failure(self):
+        """OTHER_HARD_FAILURE is a no-op for the forensic guard."""
+        ev = _other_failure_evidence()
+        outcome = classify(ev)
+        guard_forensic_artifact_present(outcome, ev)  # must not raise
+
+    def test_missing_forensic_artifact_error_contains_item_id(self):
+        """MissingForensicArtifactError message must include the item_id."""
+        ev = _emitted_hallucination_evidence(item_id="GEN 5:5", surfaced_failure_artifact=None)
+        outcome = classify(ev)
+        with pytest.raises(MissingForensicArtifactError, match="GEN 5:5"):
+            guard_forensic_artifact_present(outcome, ev)
+
+    def test_missing_forensic_artifact_error_contains_outcome_name(self):
+        """MissingForensicArtifactError message must include the outcome name."""
+        ev = _constraint_artifact_evidence(surfaced_failure_artifact=None)
+        outcome = classify(ev)
+        with pytest.raises(MissingForensicArtifactError, match="CONSTRAINT_ARTIFACT"):
+            guard_forensic_artifact_present(outcome, ev)
+
+
+# ===========================================================================
+# §20 — Rollup denominator documentation: n_generated includes OTHER_HARD_FAILURE
+# ===========================================================================
+
+class TestRollupDenominatorSemantics:
+    """Gap 4: n_generated denominator includes ALL backend_called=True units,
+    including those ending in OTHER_HARD_FAILURE. Documentation must be clear.
+    """
+
+    def test_n_generated_includes_other_hard_failure(self):
+        """OTHER_HARD_FAILURE with backend_called=True counts in n_generated."""
+        batch = [
+            _other_failure_evidence(item_id="a"),  # backend_called=True
+            _base_evidence(item_id="b"),            # backend_called=True
+        ]
+        rollup = compute_rollup(batch)
+        assert rollup.n_generated == 2  # both had backend_called=True
+
+    def test_n_generated_does_not_include_abstentions(self):
+        """Abstentions (backend_called=False) are excluded from n_generated."""
+        batch = [
+            _safe_abstention_evidence(item_id="a"),   # backend_called=False
+            _false_abstention_evidence(item_id="b"),  # backend_called=False
+            _base_evidence(item_id="c"),              # backend_called=True
+        ]
+        rollup = compute_rollup(batch)
+        assert rollup.n_generated == 1  # only the accepted one had backend_called=True
+
+    def test_accepted_rate_over_generated_denominator_includes_failures(self):
+        """accepted_rate_over_generated uses n_generated which includes hard failures."""
+        batch = [
+            _base_evidence(item_id="a"),           # ACCEPTED, backend_called=True
+            _other_failure_evidence(item_id="b"),  # OTHER_HARD_FAILURE, backend_called=True
+        ]
+        rollup = compute_rollup(batch)
+        # 1 accepted / 2 generated
+        assert rollup.n_generated == 2
+        assert rollup.n_accepted == 1
+        assert rollup.accepted_rate_over_generated == pytest.approx(0.5)
+
