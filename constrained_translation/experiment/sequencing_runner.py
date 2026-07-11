@@ -1,26 +1,31 @@
-"""constrained_translation.experiment.sequencing_runner
+"""constrained_translation.experiment.sequencing_runner  # noqa: E501
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Task 5A: Leakage-safe immutable evidence round scheduler.
 
 Provides:
 - ``SourceCandidate``: frozen, source-only view of an acquisition candidate.
-  No target_texts, no references — safe to pass to policies.
-- ``HumanEvidence``: frozen, source + revealed target for one pool item.
-  Only ever constructed after a candidate has been selected.
+  No target_texts, no references — safe to pass to policies and selectors.
+- ``HumanEvidence``: frozen, source + revealed target for one revealed item.
+  Only ever constructed after a candidate has been selected; NEVER passed
+  to the SelectorCallback.
 - ``RoundState``: frozen snapshot of one round: evidence pool, selected
   acquisition candidate, optional estimated gain, remaining source-only
   candidates. Never contains future target data.
 - ``RoundSchedule``: frozen, ordered sequence of RoundState objects plus
   manifest reference and language tag.
 - ``PoolValidationError``: raised on any violation of pool contracts.
-- ``validate_pools``: enforce cardinality, uniqueness, nonempty targets,
-  and normalized-source-equivalence leakage prohibition.
+- ``validate_pools``: enforce cardinality, uniqueness, nonempty targets
+  (seed, acquisition, fixed_eval, and the first ``expected_project_min``
+  remaining rows that form the operational project slice), and
+  normalized-source-equivalence leakage prohibition.
 - ``source_candidates_from_manifest``: adapter — strips target data.
 - ``human_evidence_from_manifest``: adapter — builds HumanEvidence for
   a named pool (seed or acquisition).
 - ``build_round_schedule``: build schedule from precomputed acq_order.
 - ``build_round_schedule_from_selector``: build schedule via per-round
-  callback; callback receives only SourceCandidate views.
+  callback; callback receives only SourceCandidate views for BOTH the
+  remaining pool and the already-translated pool — no HumanEvidence,
+  no target_text ever enters the callback.
 
 Design constraints
 ------------------
@@ -29,11 +34,19 @@ Design constraints
 - Target data is revealed only at the moment a candidate is selected
   (i.e., when adding it to evidence). Remaining candidates are always
   SourceCandidate — no target field ever appears.
+- SelectorCallback MUST NOT receive HumanEvidence or target_text.
+  The translated/current evidence view passed to the selector is an
+  immutable ``tuple[SourceCandidate, ...]`` (source fields only).
 - Normalized-source-equivalence leakage prohibition: seed, acquisition,
   and fixed_eval must each have disjoint normalized-source keys. Project
   (remaining) may contain equivalents without violation.
-- Pool cardinalities are exact (not "at least") for named pools; project
-  uses a minimum threshold (>= expected_project_min).
+- Pool cardinalities are exact (not "at least") for seed, acquisition,
+  and fixed_eval; remaining uses a minimum threshold
+  (>= expected_project_min).  The operational project slice is defined as
+  the first ``expected_project_min`` items of ``remaining`` sorted by
+  corpus_idx (default 200); only those rows are required to have a valid
+  target reference.  Later remaining rows beyond that slice are not
+  rejected solely for a missing or empty target.
 """
 from __future__ import annotations
 
@@ -249,9 +262,14 @@ def validate_pools(
     4. No corpus_idx overlap between seed and acquisition.
     5. Nonempty human target for every seed and acquisition item.
     6. Language key present in every seed and acquisition item.
-    7. Normalized-source-equivalence disjointness among seed, acquisition,
+    7. Nonempty human target for every fixed_eval item.
+    8. Nonempty human target for the first ``expected_project_min`` remaining
+       items sorted by corpus_idx — the operational project slice.  Remaining
+       rows beyond that slice are NOT rejected solely for a missing or empty
+       target; only the slice used by project selectors is validated.
+    9. Normalized-source-equivalence disjointness among seed, acquisition,
        and fixed_eval (no normalized key crosses among these three named pools).
-    8. Remaining/project may contain equivalents without violation.
+    10. Remaining/project may contain equivalents without violation.
 
     Parameters
     ----------
@@ -266,7 +284,11 @@ def validate_pools(
     expected_eval:
         Exact required cardinality of manifest.fixed_eval.
     expected_project_min:
-        Minimum required cardinality of manifest.remaining.
+        Minimum required cardinality of manifest.remaining.  Also defines
+        the operational project slice: the first ``expected_project_min``
+        remaining items (sorted by corpus_idx) must each have a nonempty
+        language target.  The default production value is 200, matching
+        the project slice used by golden/silver policies.
 
     Raises
     ------
@@ -330,7 +352,37 @@ def validate_pools(
                     f"target_text for language {language!r}."
                 )
 
-    # 8. Normalized-source-equivalence leakage prohibition among seed/acq/eval.
+    # 7b. Nonempty human target for every fixed_eval item.
+    for item in manifest.fixed_eval:
+        if language not in item.target_texts:
+            raise PoolValidationError(
+                f"fixed_eval item corpus_idx={item.corpus_idx} is missing "
+                f"language {language!r} in target_texts."
+            )
+        if not item.target_texts[language]:
+            raise PoolValidationError(
+                f"fixed_eval item corpus_idx={item.corpus_idx} has empty "
+                f"target_text for language {language!r}."
+            )
+
+    # 8. Nonempty target for the operational project slice — first expected_project_min
+    # remaining items sorted by corpus_idx.  Later remaining rows are NOT checked,
+    # because only the slice is used by project-scoped selectors.
+    if expected_project_min > 0:
+        project_slice = sorted(manifest.remaining, key=lambda it: it.corpus_idx)[:expected_project_min]
+        for item in project_slice:
+            if language not in item.target_texts:
+                raise PoolValidationError(
+                    f"remaining (project slice) item corpus_idx={item.corpus_idx} is missing "
+                    f"language {language!r} in target_texts."
+                )
+            if not item.target_texts[language]:
+                raise PoolValidationError(
+                    f"remaining (project slice) item corpus_idx={item.corpus_idx} has empty "
+                    f"target_text for language {language!r}."
+                )
+
+    # 9. Normalized-source-equivalence leakage prohibition among seed/acq/eval.
     # Each of the three named pools must have disjoint normalized keys;
     # no key may cross among them.
     seed_keys: dict[str, int] = {}
@@ -528,9 +580,16 @@ def build_round_schedule(
 # Build schedule from selector callback
 # ---------------------------------------------------------------------------
 
-# Type alias for selector callback
+# SelectorCallback — source-only view for both args, NO HumanEvidence allowed.
+#
+# remaining:   immutable tuple[SourceCandidate, ...] — candidates not yet revealed.
+# translated:  immutable tuple[SourceCandidate, ...] — source-only view of the
+#              already-translated pool (seed + previously revealed acquisitions);
+#              no target_text, no HumanEvidence.
+#
+# Returns (corpus_idx: int, estimated_gain: Optional[float]).
 SelectorCallback = Callable[
-    [list[SourceCandidate], list[HumanEvidence]],
+    [tuple[SourceCandidate, ...], tuple[SourceCandidate, ...]],
     tuple[int, Optional[float]],
 ]
 
@@ -545,12 +604,15 @@ def build_round_schedule_from_selector(
     expected_eval: int,
     expected_project_min: int,
 ) -> RoundSchedule:
-    """Build an immutable RoundSchedule via a per-round selector callback.
+    """Build an immutable RoundSchedule via a per-round source-only selector callback.
 
     The selector is invoked once per acquisition round with:
-    - ``remaining``: list of SourceCandidate (source-only; no target data).
-    - ``evidence``: list of HumanEvidence (current revealed evidence pool,
-      i.e. the evidence from the *previous* round before the new reveal).
+    - ``remaining``: immutable tuple[SourceCandidate, ...] — source-only view of
+      candidates not yet revealed.  No target_text, no HumanEvidence.
+    - ``translated``: immutable tuple[SourceCandidate, ...] — source-only view of
+      the already-translated pool (seed + previously revealed acquisitions).
+      No target_text, no HumanEvidence ever.  Preserves source IDs and order
+      needed by silver/golden policies.
 
     The selector returns ``(corpus_idx, estimated_gain)`` where:
     - ``corpus_idx`` must be the corpus_idx of one of the remaining candidates.
@@ -561,8 +623,10 @@ def build_round_schedule_from_selector(
     manifest, language, expected_*:
         As in ``build_round_schedule``.
     selector:
-        Callback ``(remaining: list[SourceCandidate], evidence: list[HumanEvidence])
+        Callback ``(remaining: tuple[SourceCandidate, ...],
+        translated: tuple[SourceCandidate, ...])
         -> (corpus_idx: int, estimated_gain: Optional[float])``.
+        MUST NOT receive HumanEvidence or target_text.
 
     Returns
     -------
@@ -598,6 +662,16 @@ def build_round_schedule_from_selector(
         for item in manifest.seed
     )
 
+    # Build source-only view of seed (for selector — no HumanEvidence passed to selector)
+    seed_source_candidates: tuple[SourceCandidate, ...] = tuple(
+        SourceCandidate(
+            corpus_idx=item.corpus_idx,
+            item_id=item.item_id,
+            source_text=item.source_text,
+        )
+        for item in manifest.seed
+    )
+
     # Build all candidates as SourceCandidate (source-only)
     all_candidates: dict[int, SourceCandidate] = {
         item.corpus_idx: SourceCandidate(
@@ -610,6 +684,9 @@ def build_round_schedule_from_selector(
 
     states: list[RoundState] = []
     current_evidence: tuple[HumanEvidence, ...] = seed_evidence
+    # translated_sources: source-only view of already-translated pool (seed + revealed acq).
+    # Passed to selector instead of HumanEvidence — no target_text ever enters the callback.
+    translated_sources: tuple[SourceCandidate, ...] = seed_source_candidates
     remaining_set: dict[int, SourceCandidate] = dict(all_candidates)
     revealed_idxs: set[int] = set()
 
@@ -627,15 +704,18 @@ def build_round_schedule_from_selector(
 
     # Rounds 1..N
     for r in range(1, len(manifest.acquisition) + 1):
-        remaining_list = [remaining_set[idx] for idx in sorted(remaining_set)]
-        evidence_list = list(current_evidence)
+        remaining_tuple: tuple[SourceCandidate, ...] = tuple(
+            remaining_set[idx] for idx in sorted(remaining_set)
+        )
 
-        # Call selector with source-only view
-        result = selector(remaining_list, evidence_list)
+        # Call selector with source-only immutable tuples — no HumanEvidence passed.
+        # remaining_tuple: candidates not yet revealed (SourceCandidate only).
+        # translated_sources: seed + previously revealed acquisitions (SourceCandidate only).
+        result = selector(remaining_tuple, translated_sources)
         chosen_idx, estimated_gain = result[0], result[1] if len(result) > 1 else None
 
         # Validate selector choice
-        if chosen_idx not in remaining_set:
+        if chosen_idx not in remaining_set:  # type: ignore[operator]
             raise ValueError(
                 f"Selector returned corpus_idx={chosen_idx} which is not in "
                 f"remaining candidates {sorted(remaining_set.keys())}"
@@ -654,6 +734,8 @@ def build_round_schedule_from_selector(
             target_text=item.target_texts[language],
         )
         current_evidence = current_evidence + (revealed,)
+        # Update source-only translated view (order preserved: seed first, then by reveal order)
+        translated_sources = translated_sources + (selected_sc,)
         del remaining_set[chosen_idx]
         revealed_idxs.add(chosen_idx)
 

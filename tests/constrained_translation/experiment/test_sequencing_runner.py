@@ -1034,3 +1034,422 @@ class TestEdgeCases:
                 original = all_manifest_items[he.corpus_idx]
                 assert he.source_text == original.source_text
                 assert he.target_text == original.target_texts[LANG]
+
+
+# ---------------------------------------------------------------------------
+# Section 12: SelectorCallback target leakage prohibition (Task 5A fix)
+# ---------------------------------------------------------------------------
+
+class TestSelectorCallbackNoTargetLeakage:
+    """SelectorCallback must NEVER receive HumanEvidence or target_text.
+
+    Both arguments are immutable tuple[SourceCandidate, ...]:
+    - remaining: not-yet-translated candidates (source-only)
+    - translated: already-translated pool view (source-only, seed + revealed acq)
+
+    This verifies the contract introduced in the Task 5A fix.
+    """
+
+    def test_selector_second_arg_is_tuple_of_source_candidates(self, tiny_manifest):
+        """Second arg to selector must be tuple[SourceCandidate, ...], not list[HumanEvidence]."""
+        received_translated: list = []
+
+        def spy(remaining, translated):
+            received_translated.append(translated)
+            return min(sc.corpus_idx for sc in remaining), None
+
+        build_round_schedule_from_selector(
+            manifest=tiny_manifest,
+            language=LANG,
+            selector=spy,
+            expected_seed=3, expected_acq=4,
+            expected_eval=2, expected_project_min=1,
+        )
+        # Must have been called once per acq round
+        assert len(received_translated) == 4
+        # Each call: translated is a tuple (immutable), NOT a list
+        for translated in received_translated:
+            assert isinstance(translated, tuple), (
+                f"translated arg is {type(translated).__name__}, expected tuple"
+            )
+        # Every item in translated must be SourceCandidate
+        for translated in received_translated:
+            for item in translated:
+                assert isinstance(item, SourceCandidate), (
+                    f"translated contains {type(item).__name__}, expected SourceCandidate"
+                )
+
+    def test_selector_second_arg_has_no_target_text_field(self, tiny_manifest):
+        """Items in the translated tuple must NOT have target_text or target_texts."""
+        violations: list[str] = []
+
+        def spy(remaining, translated):
+            for item in translated:
+                if hasattr(item, "target_text"):
+                    violations.append(f"item {item.corpus_idx} has target_text")
+                if hasattr(item, "target_texts"):
+                    violations.append(f"item {item.corpus_idx} has target_texts")
+            return min(sc.corpus_idx for sc in remaining), None
+
+        build_round_schedule_from_selector(
+            manifest=tiny_manifest,
+            language=LANG,
+            selector=spy,
+            expected_seed=3, expected_acq=4,
+            expected_eval=2, expected_project_min=1,
+        )
+        assert violations == [], f"Target leakage in translated arg: {violations}"
+
+    def test_selector_first_arg_is_tuple_of_source_candidates(self, tiny_manifest):
+        """First arg (remaining) must be tuple[SourceCandidate, ...], not list."""
+        received_remaining: list = []
+
+        def spy(remaining, translated):
+            received_remaining.append(remaining)
+            return min(sc.corpus_idx for sc in remaining), None
+
+        build_round_schedule_from_selector(
+            manifest=tiny_manifest,
+            language=LANG,
+            selector=spy,
+            expected_seed=3, expected_acq=4,
+            expected_eval=2, expected_project_min=1,
+        )
+        for remaining in received_remaining:
+            assert isinstance(remaining, tuple), (
+                f"remaining arg is {type(remaining).__name__}, expected tuple"
+            )
+            for item in remaining:
+                assert isinstance(item, SourceCandidate)
+                assert not hasattr(item, "target_text")
+                assert not hasattr(item, "target_texts")
+
+    def test_selector_callback_no_human_evidence_arg(self, tiny_manifest):
+        """Neither argument to the selector may be or contain HumanEvidence."""
+        violations: list[str] = []
+
+        def spy(remaining, translated):
+            for arg_name, arg in [("remaining", remaining), ("translated", translated)]:
+                if isinstance(arg, list):
+                    violations.append(f"{arg_name} is a list, not a tuple (HumanEvidence leakage risk)")
+                for item in arg:
+                    if isinstance(item, HumanEvidence):
+                        violations.append(f"{arg_name} contains HumanEvidence at corpus_idx={item.corpus_idx}")
+            return min(sc.corpus_idx for sc in remaining), None
+
+        build_round_schedule_from_selector(
+            manifest=tiny_manifest,
+            language=LANG,
+            selector=spy,
+            expected_seed=3, expected_acq=4,
+            expected_eval=2, expected_project_min=1,
+        )
+        assert violations == [], f"HumanEvidence leakage: {violations}"
+
+    def test_selector_dataclass_fields_source_only(self, tiny_manifest):
+        """Inspect __dataclass_fields__ of selector args — no target field allowed."""
+        violations: list[str] = []
+
+        def spy(remaining, translated):
+            for arg_name, arg in [("remaining", remaining), ("translated", translated)]:
+                for item in arg:
+                    fields = set(getattr(item, "__dataclass_fields__", {}).keys())
+                    if "target_text" in fields:
+                        violations.append(f"{arg_name}.{item.corpus_idx}: has target_text field")
+                    if "target_texts" in fields:
+                        violations.append(f"{arg_name}.{item.corpus_idx}: has target_texts field")
+            return min(sc.corpus_idx for sc in remaining), None
+
+        build_round_schedule_from_selector(
+            manifest=tiny_manifest,
+            language=LANG,
+            selector=spy,
+            expected_seed=3, expected_acq=4,
+            expected_eval=2, expected_project_min=1,
+        )
+        assert violations == [], f"Target field found in selector args: {violations}"
+
+    def test_selector_mutation_attempt_fails(self, tiny_manifest):
+        """SourceCandidate items passed to selector must be immutable (frozen)."""
+        mutation_errors: list[Exception] = []
+
+        def spy(remaining, translated):
+            for item in list(remaining) + list(translated):
+                try:
+                    item.corpus_idx = 9999  # type: ignore[misc]
+                    # Should not reach here for frozen dataclass
+                    mutation_errors.append(f"No error raised mutating {item!r}")
+                except (AttributeError, TypeError) as exc:
+                    pass  # Expected: frozen dataclass raises on mutation
+            return min(sc.corpus_idx for sc in remaining), None
+
+        build_round_schedule_from_selector(
+            manifest=tiny_manifest,
+            language=LANG,
+            selector=spy,
+            expected_seed=3, expected_acq=4,
+            expected_eval=2, expected_project_min=1,
+        )
+        assert mutation_errors == [], f"Mutation succeeded (not frozen): {mutation_errors}"
+
+    def test_translated_grows_by_one_each_round(self, tiny_manifest):
+        """translated arg must grow by exactly one SourceCandidate per round (seed + revealed)."""
+        sizes: list[int] = []
+
+        def spy(remaining, translated):
+            sizes.append(len(translated))
+            return min(sc.corpus_idx for sc in remaining), None
+
+        build_round_schedule_from_selector(
+            manifest=tiny_manifest,
+            language=LANG,
+            selector=spy,
+            expected_seed=3, expected_acq=4,
+            expected_eval=2, expected_project_min=1,
+        )
+        # Round 1: seed=3 + 0 revealed = 3
+        # Round 2: seed=3 + 1 revealed = 4
+        # ...
+        assert sizes == [3, 4, 5, 6]
+
+    def test_translated_preserves_source_ids_and_order(self, tiny_manifest):
+        """translated items have correct corpus_idx/source_text matching manifest."""
+        received: list[tuple[SourceCandidate, ...]] = []
+
+        def spy(remaining, translated):
+            received.append(translated)
+            return min(sc.corpus_idx for sc in remaining), None
+
+        build_round_schedule_from_selector(
+            manifest=tiny_manifest,
+            language=LANG,
+            selector=spy,
+            expected_seed=3, expected_acq=4,
+            expected_eval=2, expected_project_min=1,
+        )
+        seed_idx_set = {item.corpus_idx for item in tiny_manifest.seed}
+        seed_src_map = {item.corpus_idx: item.source_text for item in tiny_manifest.seed}
+        acq_src_map = {item.corpus_idx: item.source_text for item in tiny_manifest.acquisition}
+        all_src_map = {**seed_src_map, **acq_src_map}
+
+        # Round 1: translated contains exactly the seed items
+        round1_idxs = {sc.corpus_idx for sc in received[0]}
+        assert round1_idxs == seed_idx_set, f"Round 1 translated mismatch: {round1_idxs}"
+        # All source_texts must match
+        for sc in received[0]:
+            assert sc.source_text == all_src_map[sc.corpus_idx]
+
+        # Final round: translated contains seed + all 4 acq (minus 1 remaining)
+        final_idxs = {sc.corpus_idx for sc in received[-1]}
+        acq_idxs = {item.corpus_idx for item in tiny_manifest.acquisition}
+        # All seed in final; at least 3 of 4 acq revealed by then
+        assert seed_idx_set.issubset(final_idxs)
+        # Source texts preserved
+        for sc in received[-1]:
+            assert sc.source_text == all_src_map[sc.corpus_idx]
+
+
+# ---------------------------------------------------------------------------
+# Section 13: Reference validation — fixed_eval and project slice (Task 5A fix)
+# ---------------------------------------------------------------------------
+
+class TestReferenceValidation:
+    """validate_pools must check nonempty targets for fixed_eval and for the
+    first expected_project_min remaining items (the operational project slice).
+    Later remaining rows beyond the slice must NOT be rejected for missing targets.
+    """
+
+    def _make_eval_item_no_target(self, corpus_idx: int) -> SequencingPoolItem:
+        return SequencingPoolItem(
+            corpus_idx=corpus_idx,
+            item_id=f"EVAL {corpus_idx}:1",
+            source_text=f"eval source text for idx {corpus_idx}",
+            target_texts={LANG: ""},  # empty target — violation
+        )
+
+    def _make_eval_item_missing_lang(self, corpus_idx: int) -> SequencingPoolItem:
+        return SequencingPoolItem(
+            corpus_idx=corpus_idx,
+            item_id=f"EVAL {corpus_idx}:1",
+            source_text=f"eval source text for idx {corpus_idx}",
+            target_texts={"other_lang": "some text"},  # missing LANG
+        )
+
+    def _make_rem_item_no_target(self, corpus_idx: int) -> SequencingPoolItem:
+        return SequencingPoolItem(
+            corpus_idx=corpus_idx,
+            item_id=f"REM {corpus_idx}:1",
+            source_text=f"remaining source text for idx {corpus_idx}",
+            target_texts={LANG: ""},  # empty target
+        )
+
+    def _make_rem_item_missing_lang(self, corpus_idx: int) -> SequencingPoolItem:
+        return SequencingPoolItem(
+            corpus_idx=corpus_idx,
+            item_id=f"REM {corpus_idx}:1",
+            source_text=f"remaining source text for idx {corpus_idx}",
+            target_texts={"other_lang": "x"},
+        )
+
+    # --- fixed_eval validation ---
+
+    def test_fixed_eval_empty_target_raises(self, tiny_manifest):
+        """fixed_eval item with empty target must raise PoolValidationError."""
+        bad_eval = self._make_eval_item_no_target(999)
+        m = _make_manifest(
+            tiny_manifest.seed,
+            tiny_manifest.acquisition,
+            tiny_manifest.fixed_eval + [bad_eval],
+            tiny_manifest.remaining,
+        )
+        with pytest.raises(PoolValidationError, match="fixed_eval"):
+            validate_pools(m, LANG,
+                           expected_seed=3, expected_acq=4,
+                           expected_eval=3, expected_project_min=1)
+
+    def test_fixed_eval_missing_language_raises(self, tiny_manifest):
+        """fixed_eval item missing the requested language must raise PoolValidationError."""
+        bad_eval = self._make_eval_item_missing_lang(998)
+        m = _make_manifest(
+            tiny_manifest.seed,
+            tiny_manifest.acquisition,
+            tiny_manifest.fixed_eval + [bad_eval],
+            tiny_manifest.remaining,
+        )
+        with pytest.raises(PoolValidationError, match="fixed_eval"):
+            validate_pools(m, LANG,
+                           expected_seed=3, expected_acq=4,
+                           expected_eval=3, expected_project_min=1)
+
+    def test_fixed_eval_all_targets_valid_passes(self, tiny_manifest):
+        """fixed_eval items all with nonempty targets must not raise."""
+        validate_pools(tiny_manifest, LANG,
+                       expected_seed=3, expected_acq=4,
+                       expected_eval=2, expected_project_min=1)
+
+    # --- project slice validation (first expected_project_min remaining rows) ---
+
+    def test_project_slice_empty_target_raises(self):
+        """A remaining item in the operational slice (first N by corpus_idx) with empty
+        target must raise PoolValidationError."""
+        seed_items = [_pool_item(i, f"seed text {i}") for i in range(2)]
+        acq_items = [_pool_item(10 + i, f"acq text {10 + i}") for i in range(2)]
+        eval_items = [_pool_item(20, "eval text twenty")]
+        # Two remaining items; slice size=2 so both are in the slice
+        rem_ok = _pool_item(30, "remaining text thirty ok")
+        rem_bad = self._make_rem_item_no_target(31)  # in slice (corpus_idx=31 < slice end)
+        m = _make_manifest(seed_items, acq_items, eval_items, [rem_ok, rem_bad])
+        with pytest.raises(PoolValidationError, match="project slice"):
+            validate_pools(m, LANG,
+                           expected_seed=2, expected_acq=2,
+                           expected_eval=1, expected_project_min=2)
+
+    def test_project_slice_missing_lang_raises(self):
+        """A remaining item in the slice missing the requested language must raise."""
+        seed_items = [_pool_item(i, f"seed text {i}") for i in range(2)]
+        acq_items = [_pool_item(10 + i, f"acq text {10 + i}") for i in range(2)]
+        eval_items = [_pool_item(20, "eval text twenty")]
+        rem_ok = _pool_item(30, "remaining text thirty ok")
+        rem_bad = self._make_rem_item_missing_lang(31)
+        m = _make_manifest(seed_items, acq_items, eval_items, [rem_ok, rem_bad])
+        with pytest.raises(PoolValidationError, match="project slice"):
+            validate_pools(m, LANG,
+                           expected_seed=2, expected_acq=2,
+                           expected_eval=1, expected_project_min=2)
+
+    def test_beyond_project_slice_empty_target_does_not_raise(self):
+        """Remaining items BEYOND the operational slice (index >= expected_project_min)
+        must NOT be rejected solely for missing/empty target."""
+        seed_items = [_pool_item(i, f"seed text {i}") for i in range(2)]
+        acq_items = [_pool_item(10 + i, f"acq text {10 + i}") for i in range(2)]
+        eval_items = [_pool_item(20, "eval text twenty")]
+        # slice size = 1 (only corpus_idx=30 is in slice); corpus_idx=31 is beyond
+        rem_in_slice = _pool_item(30, "remaining text thirty ok")
+        rem_beyond = self._make_rem_item_no_target(31)  # beyond slice — must not raise
+        m = _make_manifest(seed_items, acq_items, eval_items, [rem_in_slice, rem_beyond])
+        # Should NOT raise — only the first 1 remaining row is in the slice
+        validate_pools(m, LANG,
+                       expected_seed=2, expected_acq=2,
+                       expected_eval=1, expected_project_min=1)
+
+    def test_beyond_project_slice_missing_lang_does_not_raise(self):
+        """Remaining items beyond the slice with a missing language must NOT raise."""
+        seed_items = [_pool_item(i, f"seed text {i}") for i in range(2)]
+        acq_items = [_pool_item(10 + i, f"acq text {10 + i}") for i in range(2)]
+        eval_items = [_pool_item(20, "eval text twenty")]
+        rem_in_slice = _pool_item(30, "remaining text thirty ok")
+        rem_beyond = self._make_rem_item_missing_lang(31)
+        m = _make_manifest(seed_items, acq_items, eval_items, [rem_in_slice, rem_beyond])
+        validate_pools(m, LANG,
+                       expected_seed=2, expected_acq=2,
+                       expected_eval=1, expected_project_min=1)
+
+    def test_zero_project_min_skips_remaining_validation(self):
+        """If expected_project_min=0, no remaining items are validated for targets."""
+        seed_items = [_pool_item(i, f"seed text {i}") for i in range(2)]
+        acq_items = [_pool_item(10 + i, f"acq text {10 + i}") for i in range(2)]
+        eval_items = [_pool_item(20, "eval text twenty")]
+        # All remaining have empty targets — should still pass when slice=0
+        rem_bad = [self._make_rem_item_no_target(30 + i) for i in range(3)]
+        m = _make_manifest(seed_items, acq_items, eval_items, rem_bad)
+        validate_pools(m, LANG,
+                       expected_seed=2, expected_acq=2,
+                       expected_eval=1, expected_project_min=0)
+
+    def test_project_slice_uses_first_n_by_corpus_idx(self):
+        """The slice must be the first expected_project_min items sorted by corpus_idx,
+        not by insertion order. Items with higher corpus_idx beyond the slice are ignored."""
+        seed_items = [_pool_item(i, f"seed text {i}") for i in range(2)]
+        acq_items = [_pool_item(10 + i, f"acq text {10 + i}") for i in range(2)]
+        eval_items = [_pool_item(20, "eval text twenty")]
+        # Insert in reverse corpus_idx order; slice=1 picks corpus_idx=30 (lowest)
+        rem_low = _pool_item(30, "remaining text lowest ok")          # in slice
+        rem_high_bad = self._make_rem_item_no_target(999)              # beyond slice
+        # Pass them in reverse order to confirm sort is by corpus_idx
+        m = _make_manifest(seed_items, acq_items, eval_items, [rem_high_bad, rem_low])
+        validate_pools(m, LANG,
+                       expected_seed=2, expected_acq=2,
+                       expected_eval=1, expected_project_min=1)
+
+    # --- production defaults cardinality documentation test ---
+
+    def test_production_default_seed_acq_eval_cardinality(self):
+        """Document exact production defaults: seed=10, acq=40, eval=60, project_min=200.
+        The project slice selects exactly the first 200 remaining rows by corpus_idx.
+        """
+        seed_items = [_pool_item(i, f"seed source sentence {i} long enough") for i in range(10)]
+        acq_items = [_pool_item(100 + i, f"acq source sentence {100 + i} long enough") for i in range(40)]
+        eval_items = [_pool_item(200 + i, f"eval source sentence {200 + i} long enough") for i in range(60)]
+        rem_items = [_pool_item(400 + i, f"rem source sentence {400 + i} long enough") for i in range(200)]
+        m = _make_manifest(seed_items, acq_items, eval_items, rem_items)
+        # Must pass with exact production defaults
+        validate_pools(m, LANG,
+                       expected_seed=10, expected_acq=40,
+                       expected_eval=60, expected_project_min=200)
+
+    def test_production_project_slice_is_first_200_by_corpus_idx(self):
+        """The operational slice (first 200 remaining by corpus_idx) is validated;
+        any item beyond that is not rejected for an empty target.
+        This documents the distinction between 'at least 200' (cardinality)
+        and 'first 200 validated' (reference check).
+        """
+        seed_items = [_pool_item(i, f"seed source sentence {i} long enough") for i in range(10)]
+        acq_items = [_pool_item(100 + i, f"acq source sentence {100 + i} long enough") for i in range(40)]
+        eval_items = [_pool_item(200 + i, f"eval source sentence {200 + i} long enough") for i in range(60)]
+        # 200 valid remaining + 5 extra beyond the slice with empty targets
+        rem_valid = [_pool_item(400 + i, f"rem source sentence {400 + i} long enough") for i in range(200)]
+        rem_extra_bad = [
+            SequencingPoolItem(
+                corpus_idx=600 + i,
+                item_id=f"REM {600 + i}:1",
+                source_text=f"extra remaining beyond slice {600 + i}",
+                target_texts={LANG: ""},  # empty — beyond slice, must not raise
+            )
+            for i in range(5)
+        ]
+        m = _make_manifest(seed_items, acq_items, eval_items, rem_valid + rem_extra_bad)
+        # Should NOT raise: 205 remaining (>= 200), first 200 all have targets
+        validate_pools(m, LANG,
+                       expected_seed=10, expected_acq=40,
+                       expected_eval=60, expected_project_min=200)
+
