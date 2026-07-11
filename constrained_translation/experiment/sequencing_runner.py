@@ -755,3 +755,393 @@ def build_round_schedule_from_selector(
         language=language,
         states=tuple(states),
     )
+
+# ===========================================================================
+# Task 5B: Leakage-safe round prediction evaluation and safety composition
+# ===========================================================================
+
+from constrained_translation.experiment.corpus_coverage import (
+    CoverageStats,
+    ProjectSlice,
+    compute_coverage_stats,
+)
+from constrained_translation.experiment.outcomes import (
+    EscapedHallucinationError,
+    MissingForensicArtifactError,
+    Outcome,
+    TranslationEvidence,
+    classify,
+    guard_forensic_artifact_present,
+    guard_no_escaped_hallucination,
+)
+from constrained_translation.protocol import UNKSpan
+from constrained_translation.unk_detector import UNKDetector as _UNKDetector
+
+_unk_detector_5b = _UNKDetector()
+
+
+@dataclass(frozen=True)
+class RetrievalExample:
+    """Immutable evidence-item view for retrieval context.
+
+    Carries source + human target for one revealed HumanEvidence item.
+    Used in PredictionRequest.retrieved_examples.
+    """
+    evidence_id: int
+    item_id: str
+    source_text: str
+    target_text: str
+
+
+@dataclass(frozen=True)
+class PredictionRequest:
+    """Immutable generation request. Contains NO query reference target.
+
+    Safe to pass directly to generation callbacks.
+    """
+    query_id: str
+    query_corpus_idx: int
+    query_source: str
+    retrieved_examples: tuple
+    known_source_types: frozenset
+
+
+@dataclass(frozen=True)
+class CellPrediction:
+    """Frozen prediction result for one item in one evaluation round."""
+    pool: str
+    item_id: str
+    corpus_idx: int
+    source_text: str
+    retrieved_evidence_ids: tuple
+    source_supported: bool
+    unsupported_spans: tuple
+    outcome: object
+    backend_called: bool
+    raw_generation: object
+    final_translation: object
+    surfaced_failure_artifact: object
+    evidence_ids_at_round: tuple
+
+
+@dataclass(frozen=True)
+class EvaluatedRound:
+    """Frozen record of one complete round of prediction evaluation."""
+    round: int
+    selected: object
+    estimated_gain: object
+    evidence_ids: tuple
+    evidence_count: int
+    project_coverage: object
+    eval_coverage: object
+    project_predictions: tuple
+    eval_predictions: tuple
+    retrieve_call_count: int
+    generate_call_count: int
+
+
+def _build_known_types_from_evidence(evidence):
+    """Return frozenset of normalized source types from all evidence items."""
+    known = set()
+    for he in evidence:
+        known.update(normalize_source_units(he.source_text))
+    return frozenset(known)
+
+
+def _unsupported_spans_for_source(source_text, known_types):
+    """Return UNKSpan tuples for contiguous unknown token runs."""
+    return _unk_detector_5b.detect(source_text, known_types)
+
+
+def _make_project_slice_from_items(items):
+    """Build a ProjectSlice directly from a sequence of SequencingPoolItem."""
+    freq_index = {}
+    for item in items:
+        for unit in normalize_source_units(item.source_text):
+            freq_index[unit] = freq_index.get(unit, 0) + 1
+    return ProjectSlice(items=list(items), limit=len(items), freq_index=freq_index)
+
+
+def _make_abstention_evidence(item_id, source_text, false_abstention, artifact):
+    """Construct a TranslationEvidence for a deterministic source abstention."""
+    return TranslationEvidence(
+        item_id=item_id,
+        source_text=source_text,
+        source_supported=False,
+        false_abstention_detected=false_abstention,
+        backend_called=False,
+        raw_generation=None,
+        exact_id_licensed=False,
+        visible_surface_licensed=False,
+        full_decode_match=False,
+        control_token_valid=False,
+        grammar_accepted=False,
+        audit_passed=False,
+        audit_reasons=[],
+        model_generated_unk=False,
+        surfaced_failure_artifact=artifact,
+        final_translation=None,
+    )
+
+
+def evaluate_round_state(
+    state,
+    project_items,
+    fixed_eval_items,
+    language,
+    retrieve_fn,
+    generate_fn,
+    optional_false_abstention_oracle=None,
+):
+    """Evaluate predictions for one round state (leakage-safe).
+
+    For each project and eval item: determines source support from
+    state.evidence (source-side only using corpus_coverage normalization),
+    then either abstains deterministically (neither callback called) or
+    invokes retrieve_fn then generate_fn.
+
+    Parameters
+    ----------
+    state : RoundState
+        The RoundState snapshot for this round.
+    project_items : sequence of SequencingPoolItem
+        Ordered sequence for the operational project slice.
+        Same canonical order every round.
+    fixed_eval_items : sequence of SequencingPoolItem
+        Ordered sequence for the fixed eval pool. Same order every round.
+    language : str
+        Language code (for provenance only; support is source-side).
+    retrieve_fn : callable
+        Signature: (PredictionRequest, tuple[HumanEvidence,...]) -> list[int].
+        Returns corpus_idx IDs from state.evidence. Unknown/duplicate IDs
+        raise ValueError. Never called for unsupported items.
+    generate_fn : callable
+        Signature: (PredictionRequest) -> TranslationEvidence.
+        Receives immutable request with NO query target. Result validated,
+        classified, and both safety guards enforced. Never called for
+        unsupported items.
+    optional_false_abstention_oracle : callable or None
+        Signature: (corpus_idx: int, source_text: str) -> bool.
+        Evaluation-only oracle; never influences retrieval or generation.
+        When True for an unsupported item, that item is classified
+        FALSE_SOURCE_ABSTENTION instead of SAFE_SOURCE_ABSTENTION.
+
+    Returns
+    -------
+    EvaluatedRound
+
+    Raises
+    ------
+    ValueError
+        On invalid retrieve_fn IDs or generate_fn evidence mismatch.
+    EscapedHallucinationError
+        If classify() returns ESCAPED_HALLUCINATION.
+    MissingForensicArtifactError
+        If a rejection outcome is missing surfaced_failure_artifact.
+    """
+    evidence_tuple = tuple(state.evidence)
+    known_types = _build_known_types_from_evidence(evidence_tuple)
+    evidence_id_set = frozenset(he.corpus_idx for he in evidence_tuple)
+    evidence_by_id = {he.corpus_idx: he for he in evidence_tuple}
+    evidence_ids_at_round = tuple(he.corpus_idx for he in evidence_tuple)
+
+    retrieve_call_count = 0
+    generate_call_count = 0
+
+    def _evaluate_item(item, pool):
+        nonlocal retrieve_call_count, generate_call_count
+
+        item_types = frozenset(normalize_source_units(item.source_text))
+        source_supported = bool(item_types & known_types)
+        unsupported_spans = _unsupported_spans_for_source(item.source_text, known_types)
+
+        if not source_supported:
+            # Deterministic abstention - neither callback called
+            false_abstention = (
+                optional_false_abstention_oracle is not None
+                and optional_false_abstention_oracle(item.corpus_idx, item.source_text)
+            )
+            artifact = " ".join(span.surface for span in unsupported_spans)
+            if not artifact:
+                artifact = item.source_text
+            te = _make_abstention_evidence(
+                item_id=item.item_id,
+                source_text=item.source_text,
+                false_abstention=false_abstention,
+                artifact=artifact,
+            )
+            outcome = classify(te)
+            return CellPrediction(
+                pool=pool,
+                item_id=item.item_id,
+                corpus_idx=item.corpus_idx,
+                source_text=item.source_text,
+                retrieved_evidence_ids=(),
+                source_supported=False,
+                unsupported_spans=unsupported_spans,
+                outcome=outcome,
+                backend_called=False,
+                raw_generation=None,
+                final_translation=None,
+                surfaced_failure_artifact=artifact,
+                evidence_ids_at_round=evidence_ids_at_round,
+            )
+
+        # Source supported: call retrieve_fn then generate_fn
+        retrieval_request = PredictionRequest(
+            query_id=item.item_id,
+            query_corpus_idx=item.corpus_idx,
+            query_source=item.source_text,
+            retrieved_examples=(),
+            known_source_types=known_types,
+        )
+
+        retrieved_ids = retrieve_fn(retrieval_request, evidence_tuple)
+        retrieve_call_count += 1
+
+        # Validate returned IDs: must belong to current evidence, no duplicates
+        seen_ids = set()
+        for rid in retrieved_ids:
+            if rid not in evidence_id_set:
+                raise ValueError(
+                    f"retrieve_fn returned corpus_idx={rid!r} which is not in "
+                    f"current state.evidence IDs {sorted(evidence_id_set)}"
+                )
+            if rid in seen_ids:
+                raise ValueError(
+                    f"retrieve_fn returned duplicate corpus_idx={rid!r}"
+                )
+            seen_ids.add(rid)
+
+        # Convert to RetrievalExample preserving human target provenance
+        retrieved_examples = tuple(
+            RetrievalExample(
+                evidence_id=rid,
+                item_id=evidence_by_id[rid].item_id,
+                source_text=evidence_by_id[rid].source_text,
+                target_text=evidence_by_id[rid].target_text,
+            )
+            for rid in retrieved_ids
+        )
+
+        # Full PredictionRequest for generate_fn - NO query target
+        gen_request = PredictionRequest(
+            query_id=item.item_id,
+            query_corpus_idx=item.corpus_idx,
+            query_source=item.source_text,
+            retrieved_examples=retrieved_examples,
+            known_source_types=known_types,
+        )
+
+        te = generate_fn(gen_request)
+        generate_call_count += 1
+
+        # Validate returned evidence against request
+        if te.item_id != item.item_id:
+            raise ValueError(
+                f"generate_fn returned item_id={te.item_id!r} but expected "
+                f"{item.item_id!r} for corpus_idx={item.corpus_idx}"
+            )
+        if te.source_text != item.source_text:
+            raise ValueError(
+                f"generate_fn returned source_text mismatch for {item.item_id!r}: "
+                f"got {te.source_text!r}, expected {item.source_text!r}"
+            )
+        if not te.backend_called:
+            raise ValueError(
+                f"generate_fn returned backend_called=False for supported item "
+                f"{item.item_id!r} (corpus_idx={item.corpus_idx}). "
+                f"Only unsupported items may abstain."
+            )
+
+        # ALWAYS enforce both safety guards before retaining result
+        outcome = classify(te)
+        guard_no_escaped_hallucination(outcome, te)
+        guard_forensic_artifact_present(outcome, te)
+
+        return CellPrediction(
+            pool=pool,
+            item_id=item.item_id,
+            corpus_idx=item.corpus_idx,
+            source_text=item.source_text,
+            retrieved_evidence_ids=tuple(retrieved_ids),
+            source_supported=True,
+            unsupported_spans=unsupported_spans,
+            outcome=outcome,
+            backend_called=True,
+            raw_generation=te.raw_generation,
+            final_translation=te.final_translation,
+            surfaced_failure_artifact=te.surfaced_failure_artifact,
+            evidence_ids_at_round=evidence_ids_at_round,
+        )
+
+    # Evaluate project items in canonical order
+    project_predictions = tuple(_evaluate_item(item, "project") for item in project_items)
+    # Evaluate eval items in fixed order
+    eval_predictions = tuple(_evaluate_item(item, "eval") for item in fixed_eval_items)
+
+    # Coverage snapshots using corpus_coverage exact functions
+    evidence_source_cells = [he.source_text for he in evidence_tuple]
+    project_slice = _make_project_slice_from_items(project_items)
+    eval_slice = _make_project_slice_from_items(fixed_eval_items)
+    project_coverage = compute_coverage_stats(project_slice, evidence_source_cells)
+    eval_coverage = compute_coverage_stats(eval_slice, evidence_source_cells)
+
+    return EvaluatedRound(
+        round=state.round,
+        selected=state.selected,
+        estimated_gain=state.estimated_gain,
+        evidence_ids=evidence_ids_at_round,
+        evidence_count=len(evidence_tuple),
+        project_coverage=project_coverage,
+        eval_coverage=eval_coverage,
+        project_predictions=project_predictions,
+        eval_predictions=eval_predictions,
+        retrieve_call_count=retrieve_call_count,
+        generate_call_count=generate_call_count,
+    )
+
+
+def evaluate_schedule(
+    schedule,
+    project_items,
+    fixed_eval_items,
+    language,
+    retrieve_fn,
+    generate_fn,
+    optional_false_abstention_oracle=None,
+):
+    """Compose evaluate_round_state over every RoundState in the schedule.
+
+    All rounds use identical project and eval item sequences (fixed order).
+
+    Parameters
+    ----------
+    schedule : RoundSchedule
+    project_items : sequence of SequencingPoolItem
+        Same canonical order for every round.
+    fixed_eval_items : sequence of SequencingPoolItem
+        Same fixed order for every round.
+    language : str
+    retrieve_fn, generate_fn, optional_false_abstention_oracle :
+        As in evaluate_round_state.
+
+    Returns
+    -------
+    tuple[EvaluatedRound, ...]
+        One per RoundState, in schedule.states order.
+    """
+    project_list = list(project_items)
+    eval_list = list(fixed_eval_items)
+    return tuple(
+        evaluate_round_state(
+            state=state,
+            project_items=project_list,
+            fixed_eval_items=eval_list,
+            language=language,
+            retrieve_fn=retrieve_fn,
+            generate_fn=generate_fn,
+            optional_false_abstention_oracle=optional_false_abstention_oracle,
+        )
+        for state in schedule.states
+    )
