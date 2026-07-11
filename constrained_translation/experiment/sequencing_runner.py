@@ -51,7 +51,7 @@ Design constraints
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional, Sequence, Union
 
 from constrained_translation.experiment.sequencing_manifest import (
     SequencingManifest,
@@ -808,34 +808,67 @@ class PredictionRequest:
 
 @dataclass(frozen=True)
 class CellPrediction:
-    """Frozen prediction result for one item in one evaluation round."""
+    """Frozen prediction result for one item in one evaluation round.
+
+    Provenance
+    ----------
+    source_supported
+        True iff the source passed the corpus-coverage gate (at least one
+        normalised source token found in the current round evidence).  When
+        False the item abstained deterministically; neither callback was called.
+
+    retrieved_evidence_ids
+        Tuple of ``corpus_idx`` integers returned by ``retrieve_fn`` for this
+        item and converted into ``RetrievalExample`` objects.  Empty tuple for
+        abstained items (no retrieval callback called).  Together with
+        ``evidence_ids_at_round`` this unambiguously identifies which subset of
+        the round evidence pool was passed to the generation callback.
+
+    evidence_ids_at_round
+        Tuple of all ``corpus_idx`` integers in ``state.evidence`` at the time
+        this cell was evaluated.  Stable across all items in the same round.
+        Provides the complete retrieval-eligible pool provenance for the round.
+
+    unsupported_spans
+        Tuple of ``UNKSpan`` objects (from ``UNKDetector``) identifying the
+        contiguous source-token runs not covered by the round evidence
+        vocabulary.  Non-empty exactly when ``source_supported`` is False and
+        there are non-punctuation unknown tokens.  Retained on CellPrediction
+        for diagnostic and downstream display.
+
+    surfaced_failure_artifact
+        The verbatim rejected text surface for rejection outcomes
+        (EMITTED_HALLUCINATION, CONSTRAINT_ARTIFACT, MODEL_GENERATED_UNK,
+        ESCAPED_HALLUCINATION) or the stringified unsupported span text for
+        abstention outcomes.  None for ACCEPTED_LICENSED.
+    """
     pool: str
     item_id: str
     corpus_idx: int
     source_text: str
-    retrieved_evidence_ids: tuple
+    retrieved_evidence_ids: tuple[int, ...]
     source_supported: bool
-    unsupported_spans: tuple
-    outcome: object
+    unsupported_spans: tuple[UNKSpan, ...]
+    outcome: Outcome
     backend_called: bool
-    raw_generation: object
-    final_translation: object
-    surfaced_failure_artifact: object
-    evidence_ids_at_round: tuple
+    raw_generation: Optional[str]
+    final_translation: Optional[str]
+    surfaced_failure_artifact: Optional[str]
+    evidence_ids_at_round: tuple[int, ...]
 
 
 @dataclass(frozen=True)
 class EvaluatedRound:
     """Frozen record of one complete round of prediction evaluation."""
     round: int
-    selected: object
-    estimated_gain: object
-    evidence_ids: tuple
+    selected: Optional[SourceCandidate]
+    estimated_gain: Optional[float]
+    evidence_ids: tuple[int, ...]
     evidence_count: int
-    project_coverage: object
-    eval_coverage: object
-    project_predictions: tuple
-    eval_predictions: tuple
+    project_coverage: Optional[object]
+    eval_coverage: Optional[object]
+    project_predictions: tuple[CellPrediction, ...]
+    eval_predictions: tuple[CellPrediction, ...]
     retrieve_call_count: int
     generate_call_count: int
 
@@ -1054,7 +1087,19 @@ def evaluate_round_state(
                 f"Only unsupported items may abstain."
             )
 
-        # ALWAYS enforce both safety guards before retaining result
+        # ALWAYS enforce both safety guards before retaining result.
+        # Both guards are integral parts of safety validation — neither is
+        # optional.  Execution order is intentional:
+        # 1. guard_no_escaped_hallucination fires first: an ESCAPED_HALLUCINATION
+        #    is an invariant violation (unlicensed generation accepted as the
+        #    final translation) and raises EscapedHallucinationError, which
+        #    short-circuits immediately by design — no CellPrediction is produced
+        #    and the error propagates to the caller.  This is not a catch-and-
+        #    continue path.
+        # 2. guard_forensic_artifact_present fires second for all other rejection
+        #    outcomes (EMITTED_HALLUCINATION, CONSTRAINT_ARTIFACT,
+        #    MODEL_GENERATED_UNK); it raises MissingForensicArtifactError if the
+        #    required surfaced_failure_artifact is absent.
         outcome = classify(te)
         guard_no_escaped_hallucination(outcome, te)
         guard_forensic_artifact_present(outcome, te)

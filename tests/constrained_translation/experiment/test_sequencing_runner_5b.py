@@ -1458,3 +1458,388 @@ class TestKnownSourceTypes:
             generate_fn=generate_fn,
         )
         assert isinstance(received[0], frozenset)
+
+
+# ---------------------------------------------------------------------------
+# Section 14: Forensic branch coverage — Task 5B gap tests
+# ---------------------------------------------------------------------------
+
+class TestConstraintArtifactForensicGuard:
+    """CONSTRAINT_ARTIFACT outcome must carry surfaced_failure_artifact.
+
+    The classify() + guard_forensic_artifact_present() pipeline runs
+    unconditionally after generate_fn returns.  CONSTRAINT_ARTIFACT means the
+    visible surface IS licensed but machinery (grammar/tokeniser/etc.) rejected
+    it.  The forensic artifact guard fires for this outcome — absence raises
+    MissingForensicArtifactError rather than silently producing a record.
+    """
+
+    def _constraint_artifact_te(self, req: PredictionRequest, *, artifact: str | None) -> TranslationEvidence:
+        """Build a TranslationEvidence that classifies as CONSTRAINT_ARTIFACT."""
+        return TranslationEvidence(
+            item_id=req.query_id,
+            source_text=req.query_source,
+            source_supported=True,
+            false_abstention_detected=False,
+            backend_called=True,
+            raw_generation="machinery rejected text",
+            # Surface IS licensed (no unlicensed tokens):
+            exact_id_licensed=True,
+            visible_surface_licensed=True,
+            # Machinery rejected it:
+            full_decode_match=True,
+            control_token_valid=True,
+            grammar_accepted=False,
+            audit_passed=False,
+            audit_reasons=["grammar constraint violated"],
+            model_generated_unk=False,
+            surfaced_failure_artifact=artifact,
+            final_translation=None,
+        )
+
+    def test_constraint_artifact_missing_artifact_raises(self, round0_state):
+        """CONSTRAINT_ARTIFACT with surfaced_failure_artifact=None → MissingForensicArtifactError."""
+        def bad_gen(req: PredictionRequest):
+            return self._constraint_artifact_te(req, artifact=None)
+
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        with pytest.raises(MissingForensicArtifactError):
+            evaluate_round_state(
+                round0_state, proj, [], LANG,
+                retrieve_fn=_simple_retrieve,
+                generate_fn=bad_gen,
+            )
+
+    def test_constraint_artifact_with_artifact_records_outcome(self, round0_state):
+        """CONSTRAINT_ARTIFACT with artifact present → CellPrediction with correct outcome."""
+        def gen(req: PredictionRequest):
+            return self._constraint_artifact_te(req, artifact="machinery rejected text")
+
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        result = evaluate_round_state(
+            round0_state, proj, [], LANG,
+            retrieve_fn=_simple_retrieve,
+            generate_fn=gen,
+        )
+        pred = result.project_predictions[0]
+        assert pred.outcome == Outcome.CONSTRAINT_ARTIFACT
+        assert pred.surfaced_failure_artifact == "machinery rejected text"
+        assert pred.backend_called is True
+        assert pred.final_translation is None
+        assert result.generate_call_count == 1
+
+
+class TestModelUNKForensicGuard:
+    """MODEL_GENERATED_UNK outcome must carry surfaced_failure_artifact.
+
+    Two paths reach MODEL_GENERATED_UNK:
+    a) model_generated_unk flag=True (explicit detector flag from caller).
+    b) model_generated_unk flag=False but raw_generation contains reserved
+       [UNK:<source>] marker syntax (safety override in classify()).
+
+    Both paths require surfaced_failure_artifact to be non-None.  The guard
+    raises MissingForensicArtifactError when the artifact is absent.
+    """
+
+    def test_model_unk_flag_true_missing_artifact_raises(self, round0_state):
+        """model_generated_unk=True + artifact=None → MissingForensicArtifactError."""
+        def bad_gen(req: PredictionRequest):
+            return TranslationEvidence(
+                item_id=req.query_id,
+                source_text=req.query_source,
+                source_supported=True,
+                false_abstention_detected=False,
+                backend_called=True,
+                raw_generation="output with [UNK:alpha]",
+                exact_id_licensed=True,
+                visible_surface_licensed=True,
+                full_decode_match=True,
+                control_token_valid=True,
+                grammar_accepted=True,
+                audit_passed=False,
+                audit_reasons=["unk marker detected"],
+                model_generated_unk=True,   # flag is True
+                surfaced_failure_artifact=None,  # MISSING — guard must fire
+                final_translation=None,
+            )
+
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        with pytest.raises(MissingForensicArtifactError):
+            evaluate_round_state(
+                round0_state, proj, [], LANG,
+                retrieve_fn=_simple_retrieve,
+                generate_fn=bad_gen,
+            )
+
+    def test_model_unk_raw_marker_flag_false_missing_artifact_raises(self, round0_state):
+        """Safety override path: flag=False, raw contains [UNK:…], artifact=None → MissingForensicArtifactError."""
+        def bad_gen(req: PredictionRequest):
+            return TranslationEvidence(
+                item_id=req.query_id,
+                source_text=req.query_source,
+                source_supported=True,
+                false_abstention_detected=False,
+                backend_called=True,
+                raw_generation="hello [UNK:zeta] world",  # reserved marker in raw
+                exact_id_licensed=True,
+                visible_surface_licensed=True,
+                full_decode_match=True,
+                control_token_valid=True,
+                grammar_accepted=True,
+                audit_passed=True,
+                audit_reasons=[],
+                model_generated_unk=False,   # caller flag is False (safety override path)
+                surfaced_failure_artifact=None,  # MISSING — guard must fire
+                final_translation=None,
+            )
+
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        with pytest.raises(MissingForensicArtifactError):
+            evaluate_round_state(
+                round0_state, proj, [], LANG,
+                retrieve_fn=_simple_retrieve,
+                generate_fn=bad_gen,
+            )
+
+    def test_model_unk_flag_true_with_artifact_records_outcome(self, round0_state):
+        """model_generated_unk=True + artifact present → CellPrediction.outcome=MODEL_GENERATED_UNK."""
+        def gen(req: PredictionRequest):
+            return TranslationEvidence(
+                item_id=req.query_id,
+                source_text=req.query_source,
+                source_supported=True,
+                false_abstention_detected=False,
+                backend_called=True,
+                raw_generation="output with [UNK:alpha]",
+                exact_id_licensed=True,
+                visible_surface_licensed=True,
+                full_decode_match=True,
+                control_token_valid=True,
+                grammar_accepted=True,
+                audit_passed=False,
+                audit_reasons=["unk marker detected"],
+                model_generated_unk=True,
+                surfaced_failure_artifact="[UNK:alpha]",
+                final_translation=None,
+            )
+
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        result = evaluate_round_state(
+            round0_state, proj, [], LANG,
+            retrieve_fn=_simple_retrieve,
+            generate_fn=gen,
+        )
+        pred = result.project_predictions[0]
+        assert pred.outcome == Outcome.MODEL_GENERATED_UNK
+        assert pred.surfaced_failure_artifact == "[UNK:alpha]"
+        assert pred.backend_called is True
+        assert pred.final_translation is None
+        assert result.generate_call_count == 1
+
+    def test_model_unk_raw_marker_flag_false_with_artifact_records_outcome(self, round0_state):
+        """Safety override path: flag=False, raw marker present, artifact set → correct outcome."""
+        def gen(req: PredictionRequest):
+            return TranslationEvidence(
+                item_id=req.query_id,
+                source_text=req.query_source,
+                source_supported=True,
+                false_abstention_detected=False,
+                backend_called=True,
+                raw_generation="hello [UNK:zeta] world",
+                exact_id_licensed=True,
+                visible_surface_licensed=True,
+                full_decode_match=True,
+                control_token_valid=True,
+                grammar_accepted=True,
+                audit_passed=True,
+                audit_reasons=[],
+                model_generated_unk=False,  # flag False — safety override fires
+                surfaced_failure_artifact="[UNK:zeta]",
+                final_translation=None,
+            )
+
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        result = evaluate_round_state(
+            round0_state, proj, [], LANG,
+            retrieve_fn=_simple_retrieve,
+            generate_fn=gen,
+        )
+        pred = result.project_predictions[0]
+        assert pred.outcome == Outcome.MODEL_GENERATED_UNK
+        assert pred.surfaced_failure_artifact == "[UNK:zeta]"
+        assert result.generate_call_count == 1
+
+
+class TestOtherHardFailurePath:
+    """OTHER_HARD_FAILURE: generation count increments, record retained, guards do not falsely reject.
+
+    OTHER_HARD_FAILURE is reached when the backend was called but none of the
+    explicit outcome branches matched.  A common cause is backend_called=True
+    with raw_generation=None (crash/timeout).  Another is an unusual combination
+    where none of priorities 3-6 apply.
+
+    Guards must NOT fire for OTHER_HARD_FAILURE (it is not in
+    _FORENSIC_ARTIFACT_REQUIRED and is not ESCAPED_HALLUCINATION), so the
+    record IS retained and generate_call_count is incremented.
+    """
+
+    def test_backend_called_raw_none_records_other_hard_failure(self, round0_state):
+        """backend_called=True, raw_generation=None → OTHER_HARD_FAILURE; counter increments."""
+        def crash_gen(req: PredictionRequest):
+            return TranslationEvidence(
+                item_id=req.query_id,
+                source_text=req.query_source,
+                source_supported=True,
+                false_abstention_detected=False,
+                backend_called=True,
+                raw_generation=None,   # crash/timeout — no output
+                exact_id_licensed=False,
+                visible_surface_licensed=False,
+                full_decode_match=False,
+                control_token_valid=False,
+                grammar_accepted=False,
+                audit_passed=False,
+                audit_reasons=["backend crash"],
+                model_generated_unk=False,
+                surfaced_failure_artifact=None,  # absent — guard must NOT fire for OTHER_HARD_FAILURE
+                final_translation=None,
+            )
+
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        result = evaluate_round_state(
+            round0_state, proj, [], LANG,
+            retrieve_fn=_simple_retrieve,
+            generate_fn=crash_gen,
+        )
+        pred = result.project_predictions[0]
+        assert pred.outcome == Outcome.OTHER_HARD_FAILURE
+        assert pred.backend_called is True
+        assert pred.raw_generation is None
+        assert pred.surfaced_failure_artifact is None
+        # generate_call_count must be incremented (backend was called)
+        assert result.generate_call_count == 1
+        # retrieve_call_count also incremented (supported item calls retrieve)
+        assert result.retrieve_call_count == 1
+
+    def test_other_hard_failure_guards_do_not_reject(self, round0_state):
+        """Neither safety guard raises for OTHER_HARD_FAILURE outcome."""
+        # OTHER_HARD_FAILURE is not in _FORENSIC_ARTIFACT_REQUIRED and is
+        # not ESCAPED_HALLUCINATION — both guards must be no-ops for it.
+        from constrained_translation.experiment.outcomes import (
+            guard_no_escaped_hallucination,
+            guard_forensic_artifact_present,
+        )
+        te = TranslationEvidence(
+            item_id="X 1:1",
+            source_text="some source",
+            source_supported=True,
+            false_abstention_detected=False,
+            backend_called=True,
+            raw_generation=None,
+            exact_id_licensed=False,
+            visible_surface_licensed=False,
+            full_decode_match=False,
+            control_token_valid=False,
+            grammar_accepted=False,
+            audit_passed=False,
+            audit_reasons=[],
+            model_generated_unk=False,
+            surfaced_failure_artifact=None,
+            final_translation=None,
+        )
+        outcome = Outcome.OTHER_HARD_FAILURE
+        # Must not raise
+        guard_no_escaped_hallucination(outcome, te)
+        guard_forensic_artifact_present(outcome, te)
+
+    def test_other_hard_failure_record_retained_in_predictions(self, round0_state):
+        """OTHER_HARD_FAILURE produces a CellPrediction retained in project_predictions."""
+        def crash_gen(req: PredictionRequest):
+            return TranslationEvidence(
+                item_id=req.query_id,
+                source_text=req.query_source,
+                source_supported=True,
+                false_abstention_detected=False,
+                backend_called=True,
+                raw_generation=None,
+                exact_id_licensed=False,
+                visible_surface_licensed=False,
+                full_decode_match=False,
+                control_token_valid=False,
+                grammar_accepted=False,
+                audit_passed=False,
+                audit_reasons=["crash"],
+                model_generated_unk=False,
+                surfaced_failure_artifact=None,
+                final_translation=None,
+            )
+
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        result = evaluate_round_state(
+            round0_state, proj, [], LANG,
+            retrieve_fn=_simple_retrieve,
+            generate_fn=crash_gen,
+        )
+        assert len(result.project_predictions) == 1
+        pred = result.project_predictions[0]
+        assert pred.corpus_idx == 30
+        assert pred.outcome == Outcome.OTHER_HARD_FAILURE
+
+
+# ---------------------------------------------------------------------------
+# Section 15: CellPrediction typing contract
+# ---------------------------------------------------------------------------
+
+class TestCellPredictionTypingContract:
+    """Verify that CellPrediction field types match the tightened annotations.
+
+    retrieved_evidence_ids: tuple[int, ...]
+    unsupported_spans: tuple[UNKSpan, ...]  (or empty tuple)
+    evidence_ids_at_round: tuple[int, ...]
+    outcome: Outcome (enum member)
+    """
+
+    def _get_supported_pred(self, round0_state):
+        proj = [_item(30, PROJ_S_SRC, "pt0")]
+        result = evaluate_round_state(
+            round0_state, proj, [], LANG,
+            retrieve_fn=_simple_retrieve,
+            generate_fn=_good_te,
+        )
+        return result.project_predictions[0]
+
+    def _get_unsupported_pred(self, round0_state):
+        proj = [_item(31, PROJ_U_SRC, "pt1")]
+        result = evaluate_round_state(
+            round0_state, proj, [], LANG,
+            retrieve_fn=_simple_retrieve,
+            generate_fn=_good_te,
+        )
+        return result.project_predictions[0]
+
+    def test_retrieved_evidence_ids_is_tuple_of_ints(self, round0_state):
+        pred = self._get_supported_pred(round0_state)
+        assert isinstance(pred.retrieved_evidence_ids, tuple)
+        for v in pred.retrieved_evidence_ids:
+            assert isinstance(v, int), f"Expected int, got {type(v)!r}"
+
+    def test_evidence_ids_at_round_is_tuple_of_ints(self, round0_state):
+        pred = self._get_supported_pred(round0_state)
+        assert isinstance(pred.evidence_ids_at_round, tuple)
+        for v in pred.evidence_ids_at_round:
+            assert isinstance(v, int), f"Expected int, got {type(v)!r}"
+
+    def test_unsupported_spans_is_tuple(self, round0_state):
+        pred_s = self._get_supported_pred(round0_state)
+        pred_u = self._get_unsupported_pred(round0_state)
+        assert isinstance(pred_s.unsupported_spans, tuple)
+        assert isinstance(pred_u.unsupported_spans, tuple)
+
+    def test_outcome_is_outcome_enum(self, round0_state):
+        pred = self._get_supported_pred(round0_state)
+        assert isinstance(pred.outcome, Outcome)
+
+    def test_unsupported_retrieved_ids_empty_tuple(self, round0_state):
+        pred = self._get_unsupported_pred(round0_state)
+        assert pred.retrieved_evidence_ids == ()
+        assert isinstance(pred.retrieved_evidence_ids, tuple)
